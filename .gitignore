@@ -1,0 +1,23 @@
+# Archivos compilados
+bin/
+obj/
+
+# Visual Studio
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Archivos del sistema
+*.DS_Store
+Thumbs.db
+
+# VS Code config local (opcional)
+.vscode/*
+!.vscode/tasks.json
+
+# Archivos temporales
+*.log
+
+# Otros
+*.algo
