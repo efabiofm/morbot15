@@ -22,7 +22,7 @@ namespace cAlgo.Robots
         [Parameter("Risk Percent", DefaultValue = 2)]
         public double RiskPercent { get; set; }
 
-        [Parameter("Risk-Reward Ratio", DefaultValue = 1.5)]
+        [Parameter("Risk-Reward Ratio", DefaultValue = 0.2)]
         public double RiskReward { get; set; }
 
         // Cálculo básico para saber si el día está dentro del horario de verano en EE.UU.
@@ -106,7 +106,7 @@ namespace cAlgo.Robots
                         rangeLow = Math.Min(rangeLow, Bars.LowPrices[i]);
                     }
                 }
-                
+
                 // Verificamos si encontramos al menos una barra para definir el rango
                 if (rangeHigh != double.MinValue && rangeLow != double.MaxValue)
                 {
@@ -127,17 +127,23 @@ namespace cAlgo.Robots
             {
                 double close = Bars.ClosePrices.Last(1); // cierre de vela anterior
 
-                if (close > rangeHigh) 
+                if (close > rangeHigh)
                 {
                     ExecuteTrade(TradeType.Buy);
                     tradeExecutedToday = true;
                 }
-                else if (close < rangeLow) 
+                else if (close < rangeLow)
                 {
                     ExecuteTrade(TradeType.Sell);
                     tradeExecutedToday = true;
                 }
             }
+        }
+
+        private void ImprimirRiesgoUSD(double volumeInUnits, double pipValuePerUnit, double stopLossPips)
+        {
+            double riesgoUSD = volumeInUnits * pipValuePerUnit * stopLossPips;
+            Print($"Riesgo en USD: {riesgoUSD:F2} (Unidades: {volumeInUnits}, SL: {stopLossPips} pips, Valor por unidad: {pipValuePerUnit})");
         }
 
         private void ExecuteTrade(TradeType tradeType)
@@ -157,19 +163,19 @@ namespace cAlgo.Robots
             {
                 entryPrice = Symbol.Bid;
             }
-            
-            double stopLossPriceDistance = Math.Abs(entryPrice - rangeMid);
-            
+
+            double stopLossPriceDistance = Math.Abs(entryPrice - rangeMid) / 2;
+
             // Convertimos la distancia a pips.
             double stopLossPips = stopLossPriceDistance / Symbol.PipSize;
 
             // --- 3. CALCULAR EL VOLUMEN DE LA ORDEN EN UNIDADES ---
             double pipValue = Symbol.PipValue;
             double volumeInUnits = riskAmountInUSD / (stopLossPips * pipValue);
-            
+
             // --- 4. AJUSTAR EL VOLUMEN A UN VALOR VÁLIDO ---
             double normalizedVolume = Symbol.NormalizeVolumeInUnits(volumeInUnits, RoundingMode.Down);
-            
+
             // Si el volumen no es válido, detenemos la ejecución.
             if (normalizedVolume <= 0)
             {
@@ -178,10 +184,13 @@ namespace cAlgo.Robots
             }
 
             // --- 5. CALCULAR LOS PRECIOS DE SL Y TP ---
-            // El precio del Stop Loss es el punto medio del rango.
-            double stopLossPrice = rangeMid;
+            double stopLossPrice;
+            if (tradeType == TradeType.Buy)
+                stopLossPrice = entryPrice - stopLossPriceDistance;
+            else
+                stopLossPrice = entryPrice + stopLossPriceDistance;
 
-            // El precio del Take Profit es 1:1, la misma distancia que el SL.
+            // El precio del Take Profit se calcula basado en el risk-reward.
             double takeProfitPrice;
             double takeProfitDistance = stopLossPriceDistance * RiskReward;
 
@@ -195,13 +204,13 @@ namespace cAlgo.Robots
             }
 
             // --- VERIFICACIONES DE SEGURIDAD ANTES DE EJECUTAR ---
-            if (double.IsNaN(stopLossPrice) || double.IsInfinity(stopLossPrice) || 
+            if (double.IsNaN(stopLossPrice) || double.IsInfinity(stopLossPrice) ||
                 double.IsNaN(takeProfitPrice) || double.IsInfinity(takeProfitPrice))
             {
                 Print("ERROR CRÍTICO: SL o TP calculados como valores no válidos. Cancelando la orden.");
                 return;
             }
-            
+
             // cTrader requiere que el SL y el TP no sean idénticos al precio de entrada.
             if (Math.Abs(stopLossPrice - entryPrice) < Symbol.PipSize ||
                 Math.Abs(takeProfitPrice - entryPrice) < Symbol.PipSize)
@@ -210,6 +219,8 @@ namespace cAlgo.Robots
                 return;
             }
 
+            ImprimirRiesgoUSD(normalizedVolume, Symbol.PipValue, stopLossPips);
+
             // --- 6. EJECUTAR LA ORDEN Y ESTABLECER SL/TP ---
             // Primero, ejecutamos la orden de mercado.
             var result = ExecuteMarketOrder(tradeType, SymbolName, normalizedVolume, "ORB");
@@ -217,7 +228,7 @@ namespace cAlgo.Robots
             if (result.IsSuccessful)
             {
                 Position position = result.Position;
-                
+
                 // Verificamos que el objeto 'position' sea válido.
                 if (position == null)
                 {
@@ -232,7 +243,7 @@ namespace cAlgo.Robots
                 if (!modifyResult.IsSuccessful)
                 {
                     Print("ADVERTENCIA: Primer intento de establecer SL/TP fallido. Reintentando...");
-                    
+
                     // Reintentamos inmediatamente.
                     modifyResult = ModifyPosition(position, stopLossPrice, takeProfitPrice);
 
@@ -249,7 +260,7 @@ namespace cAlgo.Robots
                 }
                 else
                 {
-                    Print("Orden de {0} ejecutada con éxito. SL en {1}, TP en {2} establecidos.", 
+                    Print("Orden de {0} ejecutada con éxito. SL en {1}, TP en {2} establecidos.",
                         tradeType, stopLossPrice, takeProfitPrice);
                 }
             }
