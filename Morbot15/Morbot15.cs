@@ -22,6 +22,9 @@ namespace cAlgo.Robots
         [Parameter("Risk Percent", DefaultValue = 2)]
         public double RiskPercent { get; set; }
 
+        [Parameter("Risk-Reward Ratio", DefaultValue = 1.5)]
+        public double RiskReward { get; set; }
+
         // Cálculo básico para saber si el día está dentro del horario de verano en EE.UU.
         private bool IsUsDaylightSaving(DateTime date)
         {
@@ -180,13 +183,15 @@ namespace cAlgo.Robots
 
             // El precio del Take Profit es 1:1, la misma distancia que el SL.
             double takeProfitPrice;
+            double takeProfitDistance = stopLossPriceDistance * RiskReward;
+
             if (tradeType == TradeType.Buy)
             {
-                takeProfitPrice = entryPrice + stopLossPriceDistance;
+                takeProfitPrice = entryPrice + takeProfitDistance;
             }
             else
             {
-                takeProfitPrice = entryPrice - stopLossPriceDistance;
+                takeProfitPrice = entryPrice - takeProfitDistance;
             }
 
             // --- VERIFICACIONES DE SEGURIDAD ANTES DE EJECUTAR ---
