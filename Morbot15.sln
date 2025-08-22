@@ -3,6 +3,8 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 16
 VisualStudioVersion = 16.0.30011.22
 MinimumVisualStudioVersion = 10.0.40219.1
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "BARSignals", "..\..\Indicators\BARSignals\BARSignals\BARSignals.csproj", "{875645bf-4d30-4743-abce-4694dc7e05f5}"
+EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Morbot15", "Morbot15\Morbot15.csproj", "{ae0d29b0-ffd6-4df6-9c96-83367dc9ed16}"
 EndProject
 Global
@@ -20,3 +22,4 @@ Global
 		HideSolutionNode = FALSE
 	EndGlobalSection
 EndGlobal
+

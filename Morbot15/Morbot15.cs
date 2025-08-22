@@ -1,273 +1,296 @@
 using cAlgo.API;
 using cAlgo.API.Internals;
+using cAlgo.Indicators;
 using System;
+using System.Collections.Generic;
 
 namespace cAlgo.Robots
 {
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
-    public class OpeningRangeBreakout : Robot
+    public class BARSignalsTrader_CloseBar_Buffer : Robot
     {
-        private double rangeHigh;
-        private double rangeLow;
-        private double rangeMid;
-
-        private DateTime sessionStartUtc;
-        private DateTime sessionEndUtc;
-        private DateTime sessionCloseUtc;
-        private DateTime currentSessionDate = DateTime.MinValue;
-
-        private bool rangeDefined = false;
-        private bool tradeExecutedToday = false;
-
-        [Parameter("Risk Percent", DefaultValue = 2)]
+        // --- Parámetros ---
+        [Parameter("Riesgo %", DefaultValue = 2.0, MinValue = 0.1, MaxValue = 10)]
         public double RiskPercent { get; set; }
 
-        [Parameter("Risk-Reward Ratio", DefaultValue = 0.2)]
-        public double RiskReward { get; set; }
+        [Parameter("Offset SL (pips)", DefaultValue = 20, MinValue = 0)]
+        public int ExtraSLPips { get; set; }
 
-        // Cálculo básico para saber si el día está dentro del horario de verano en EE.UU.
-        private bool IsUsDaylightSaving(DateTime date)
+        [Parameter("TP en múltiplos de R", DefaultValue = 2.0, MinValue = 0.1)]
+        public double TpRR { get; set; }
+
+        [Parameter("Tomar parcial en 1er objetivo", DefaultValue = true)]
+        public bool EnablePartial { get; set; }
+
+        [Parameter("Distancia 1er parcial (R)", DefaultValue = 1.0, MinValue = 0.1)]
+        public double PartialRR { get; set; }
+
+        [Parameter("Operar solo sesión NY", DefaultValue = true)]
+        public bool OnlyNySession { get; set; }
+
+        [Parameter("Cerrar al fin de sesión", DefaultValue = true)]
+        public bool FlatAtSessionEnd { get; set; }
+
+        [Parameter("Buffer cierre (seg)", DefaultValue = 60, MinValue = 5, MaxValue = 900)]
+        public int CloseBufferSeconds { get; set; }
+
+        [Parameter("Límite de trades por día", DefaultValue = 2, MinValue = 0, MaxValue = 20)]
+        public int DailyTradeLimit { get; set; }
+
+        [Parameter("Hora límite sin trades (ET, HH:mm)", DefaultValue = "11:00")]
+        public string NoTradeAfterEtStr { get; set; }
+
+        [Parameter("Etiqueta", DefaultValue = "BARSignalsTrader_CloseBar_Buffer")]
+        public string LabelName { get; set; }
+
+        // --- Estado ---
+        private BARSignals _sig;
+        private DateTime _currentEtDate = DateTime.MinValue;
+        private DateTime _orStartEt, _sessEndEt, _cutoffEt;
+        private DateTime _orStartUtc, _sessEndUtc, _flattenUtc, _cutoffUtc;
+        private DateTime _startedUtc;
+
+        private readonly HashSet<long> _partialDone = new HashSet<long>();
+        private int _tradesToday = 0;
+
+        protected override void OnStart()
         {
-            int year = date.Year;
-
-            DateTime dstStart = GetNthWeekdayOfMonth(year, 3, DayOfWeek.Sunday, 2);  // 2do domingo de marzo
-            DateTime dstEnd = GetNthWeekdayOfMonth(year, 11, DayOfWeek.Sunday, 1);   // 1er domingo de noviembre
-
-            return date >= dstStart && date < dstEnd;
-        }
-
-        private DateTime GetNthWeekdayOfMonth(int year, int month, DayOfWeek dayOfWeek, int occurrence)
-        {
-            DateTime date = new DateTime(year, month, 1);
-            int count = 0;
-
-            while (date.Month == month)
-            {
-                if (date.DayOfWeek == dayOfWeek)
-                {
-                    count++;
-                    if (count == occurrence)
-                        return date;
-                }
-                date = date.AddDays(1);
-            }
-
-            throw new Exception("Fecha no encontrada para DST");
+            _sig = Indicators.GetIndicator<BARSignals>();
+            _startedUtc = Server.Time;
+            RecomputeSessionBounds(_startedUtc);
+            Timer.Start(1);
         }
 
         protected override void OnBar()
         {
-            DateTime now = Bars.OpenTimes.LastValue;
+            var nowUtc = Server.Time;
 
-            // Detectar cambio de día
-            if (now.Date != currentSessionDate)
-            {
-                currentSessionDate = now.Date;
-                tradeExecutedToday = false;
-                rangeDefined = false;
+            RecomputeSessionBounds(nowUtc);
 
-                // Ajustar por horario de verano (DST)
-                // Si entre marzo y noviembre → apertura NY = 13:30 UTC
-                // Si entre nov y marzo → apertura NY = 14:30 UTC
-                bool isDST = IsUsDaylightSaving(now.Date);
+            if (FlatAtSessionEnd && nowUtc >= _flattenUtc && HasOpenPosition())
+                CloseAllPositions();
 
-                double nyOpenUtcHour = isDST ? 13.5 : 14.5;
+            var barCloseUtc = Bars.OpenTimes.Last(0); // cierre de la vela previa
+            if (barCloseUtc < _startedUtc) return;
 
-                sessionStartUtc = currentSessionDate.AddHours(nyOpenUtcHour);   // 9:30 NY
-                sessionEndUtc = sessionStartUtc.AddMinutes(15);                 // 9:45 NY
-                sessionCloseUtc = sessionStartUtc.AddHours(6).AddMinutes(20);   // 15:55 NY
-
-                Print("Nuevo día detectado: {0} | DST: {1} | Apertura NY: {2} UTC", currentSessionDate.ToShortDateString(), isDST, nyOpenUtcHour);
-            }
-
-            // Si hay una posición abierta y ya terminó la sesión, cerrarla
-            if (now >= sessionCloseUtc)
-            {
-                foreach (var pos in Positions)
-                {
-                    if (pos.SymbolName == SymbolName)
-                        ClosePosition(pos);
-                }
+            // Ventana sesión: [09:30 ET, 16:00 ET - buffer)
+            if (OnlyNySession && (barCloseUtc < _orStartUtc || barCloseUtc >= _flattenUtc))
                 return;
-            }
 
-            if (!rangeDefined && now >= sessionEndUtc)
+            // Cutoff: si no hubo trades antes de la hora límite, no abrir
+            if (_tradesToday == 0 && barCloseUtc >= _cutoffUtc)
+                return;
+
+            // Límite diario
+            if (DailyTradeLimit >= 0 && _tradesToday >= DailyTradeLimit)
+                return;
+
+            // Una sola posición
+            if (HasOpenPosition()) return;
+
+            // Señal de la vela que acaba de cerrar
+            bool buy  = _sig.BuySignal.Last(1)  == 1.0;
+            bool sell = _sig.SellSignal.Last(1) == -1.0;
+            if (!buy && !sell) return;
+
+            // Datos de la vela de señal (la que cerró)
+            double barOpen  = Bars.OpenPrices.Last(1);
+            double barHigh  = Bars.HighPrices.Last(1);
+            double barLow   = Bars.LowPrices.Last(1);
+
+            if (buy)
             {
-                rangeHigh = double.MinValue;
-                rangeLow = double.MaxValue;
+                double entry = Symbol.Ask;
+                double stopPrice = Math.Min(barLow, barOpen) - ExtraSLPips * Symbol.PipSize;
+                int stopPips = PipsFrom(entry, stopPrice, TradeType.Buy);
+                if (stopPips <= 0) return;
 
-                // Bucle para encontrar el High/Low del rango
-                for (int i = Bars.Count - 1; i >= 0; i--)
-                {
-                    DateTime t = Bars.OpenTimes[i];
-                    if (t >= sessionStartUtc && t < sessionEndUtc)
-                    {
-                        rangeHigh = Math.Max(rangeHigh, Bars.HighPrices[i]);
-                        rangeLow = Math.Min(rangeLow, Bars.LowPrices[i]);
-                    }
-                }
+                double vol = VolumeForRisk(RiskPercent, stopPips);
+                if (vol < Symbol.VolumeInUnitsMin) return;
 
-                // Verificamos si encontramos al menos una barra para definir el rango
-                if (rangeHigh != double.MinValue && rangeLow != double.MaxValue)
+                int tpPips = (int)Math.Ceiling(stopPips * TpRR);
+                var res = ExecuteMarketOrder(TradeType.Buy, SymbolName, vol, LabelName, stopPips, tpPips);
+                if (res.IsSuccessful && res.Position != null)
                 {
-                    rangeMid = (rangeHigh + rangeLow) / 2;
-                    rangeDefined = true;
-                    Print("Opening Range High: {0}, Low: {1}, Mid: {2}", rangeHigh, rangeLow, rangeMid);
-                }
-                else
-                {
-                    // Si no se encontró el rango, el bot espera
-                    Print("No se encontraron barras para definir el rango de apertura. Esperando al próximo día.");
-                    return; // Salir de la función OnBar para no ejecutar el trade
+                    _partialDone.Remove(res.Position.Id);
+                    _tradesToday++;
                 }
             }
-
-            // Esperar breakout con cierre por fuera del rango
-            if (rangeDefined && Positions.Count == 0 && !tradeExecutedToday)
+            else if (sell)
             {
-                double close = Bars.ClosePrices.Last(1); // cierre de vela anterior
+                double entry = Symbol.Bid;
+                double stopPrice = Math.Max(barHigh, barOpen) + ExtraSLPips * Symbol.PipSize;
+                int stopPips = PipsFrom(entry, stopPrice, TradeType.Sell);
+                if (stopPips <= 0) return;
 
-                if (close > rangeHigh)
+                double vol = VolumeForRisk(RiskPercent, stopPips);
+                if (vol < Symbol.VolumeInUnitsMin) return;
+
+                int tpPips = (int)Math.Ceiling(stopPips * TpRR);
+                var res = ExecuteMarketOrder(TradeType.Sell, SymbolName, vol, LabelName, stopPips, tpPips);
+                if (res.IsSuccessful && res.Position != null)
                 {
-                    ExecuteTrade(TradeType.Buy);
-                    tradeExecutedToday = true;
-                }
-                else if (close < rangeLow)
-                {
-                    ExecuteTrade(TradeType.Sell);
-                    tradeExecutedToday = true;
+                    _partialDone.Remove(res.Position.Id);
+                    _tradesToday++;
                 }
             }
         }
 
-        private void ImprimirRiesgoUSD(double volumeInUnits, double pipValuePerUnit, double stopLossPips)
+        protected override void OnTick()
         {
-            double riesgoUSD = volumeInUnits * pipValuePerUnit * stopLossPips;
-            Print($"Riesgo en USD: {riesgoUSD:F2} (Unidades: {volumeInUnits}, SL: {stopLossPips} pips, Valor por unidad: {pipValuePerUnit})");
+            // Parcial configurable al tick + mover SL a BE conservando TP
+            if (EnablePartial)
+            {
+                var positions = Positions.FindAll(LabelName, SymbolName);
+                foreach (var p in positions)
+                {
+                    if (p == null || !p.StopLoss.HasValue) continue;
+                    if (_partialDone.Contains(p.Id)) continue;
+
+                    if (ReachedRR(p, PartialRR))
+                    {
+                        // cerrar 50%
+                        double toClose = Symbol.NormalizeVolumeInUnits(p.VolumeInUnits * 0.5, RoundingMode.ToNearest);
+                        if (toClose >= Symbol.VolumeInUnitsMin)
+                            ClosePosition(p, toClose);
+
+                        // mover SL a BE y conservar TP existente
+                        double tpKeep = p.TakeProfit.HasValue ? p.TakeProfit.Value : p.EntryPrice; // fallback
+                        double slBE   = p.EntryPrice;
+
+                        var mod = ModifyPosition(p, slBE, tpKeep);
+                        if (!mod.IsSuccessful) Print("ModifyPosition fallo: {0}", mod.Error);
+
+                        _partialDone.Add(p.Id);
+                    }
+                }
+            }
+
+            // Flatten por buffer si aplica
+            if (!FlatAtSessionEnd) return;
+            var nowUtc = Server.Time;
+            if (nowUtc >= _flattenUtc && HasOpenPosition())
+                CloseAllPositions();
         }
 
-        private void ExecuteTrade(TradeType tradeType)
+        protected override void OnTimer()
         {
-            // --- 1. CALCULAR LA CANTIDAD DE RIESGO EN DÓLARES ---
-            double accountBalance = Account.Balance;
-            double riskAmountInUSD = accountBalance * (RiskPercent / 100);
+            if (!FlatAtSessionEnd) return;
+            var nowUtc = Server.Time;
+            if (nowUtc >= _flattenUtc && HasOpenPosition())
+                CloseAllPositions();
+        }
 
-            // --- 2. DETERMINAR LA DISTANCIA DEL STOP LOSS ---
-            // El precio de entrada será el precio de mercado actual.
-            double entryPrice;
-            if (tradeType == TradeType.Buy)
+        // --- Utilidades ---
+        private bool ReachedRR(Position p, double rr)
+        {
+            double risk = RiskDistancePrice(p);
+            if (risk <= 0) return false;
+
+            double target = p.TradeType == TradeType.Buy
+                ? p.EntryPrice + rr * risk
+                : p.EntryPrice - rr * risk;
+
+            return p.TradeType == TradeType.Buy
+                ? Symbol.Bid >= target
+                : Symbol.Ask <= target;
+        }
+
+        private double RiskDistancePrice(Position p)
+        {
+            if (!p.StopLoss.HasValue) return 0;
+            return p.TradeType == TradeType.Buy
+                ? p.EntryPrice - p.StopLoss.Value
+                : p.StopLoss.Value - p.EntryPrice;
+        }
+
+        private int PipsFrom(double entry, double stopPrice, TradeType side)
+        {
+            double distance = side == TradeType.Buy ? entry - stopPrice : stopPrice - entry;
+            if (distance <= 0) return 0;
+            int stopPips = (int)Math.Ceiling(distance / Symbol.PipSize);
+            return stopPips;
+        }
+
+        private double VolumeForRisk(double riskPercent, int stopPips)
+        {
+            double riskMoney = Account.Balance * (riskPercent / 100.0);
+            if (stopPips <= 0 || Symbol.PipValue <= 0) return 0;
+
+            double rawUnits = riskMoney / (stopPips * Symbol.PipValue);
+            double vol = Symbol.NormalizeVolumeInUnits(rawUnits, RoundingMode.ToNearest);
+
+            if (vol < Symbol.VolumeInUnitsMin) return 0;
+            if (vol > Symbol.VolumeInUnitsMax) vol = Symbol.VolumeInUnitsMax;
+            return vol;
+        }
+
+        private bool HasOpenPosition()
+        {
+            var positions = Positions.FindAll(LabelName, SymbolName);
+            return positions != null && positions.Length > 0;
+        }
+
+        private void CloseAllPositions()
+        {
+            foreach (var p in Positions.FindAll(LabelName, SymbolName))
+                ClosePosition(p);
+        }
+
+        private void RecomputeSessionBounds(DateTime nowUtc)
+        {
+            var nowEt = UtcToEt(nowUtc);
+            if (nowEt.Date != _currentEtDate)
             {
-                entryPrice = Symbol.Ask;
+                _currentEtDate = nowEt.Date;
+
+                _orStartEt = _currentEtDate.AddHours(9).AddMinutes(30);
+                _sessEndEt = _currentEtDate.AddHours(16);
+
+                // Parse hora límite desde string (HH:mm o HH:mm:ss). Default 11:00 si falla.
+                TimeSpan cutoffSpan;
+                if (!TimeSpan.TryParse(NoTradeAfterEtStr, out cutoffSpan))
+                    cutoffSpan = new TimeSpan(11, 0, 0);
+
+                _cutoffEt  = _currentEtDate + cutoffSpan;
+
+                _orStartUtc = EtToUtc(_orStartEt);
+                _sessEndUtc = EtToUtc(_sessEndEt);
+                _flattenUtc = EtToUtc(_sessEndEt.AddSeconds(-CloseBufferSeconds));
+                _cutoffUtc  = EtToUtc(_cutoffEt);
+
+                // reset diario
+                _tradesToday = 0;
+                _partialDone.Clear();
             }
-            else
-            {
-                entryPrice = Symbol.Bid;
-            }
+        }
 
-            double stopLossPriceDistance = Math.Abs(entryPrice - rangeMid) / 2;
+        // UTC <-> ET con DST EE. UU.
+        private DateTime UtcToEt(DateTime utc)
+        {
+            return IsEtDstByLocalDate(utc.AddHours(-5)) ? utc.AddHours(-4) : utc.AddHours(-5);
+        }
 
-            // Convertimos la distancia a pips.
-            double stopLossPips = stopLossPriceDistance / Symbol.PipSize;
+        private DateTime EtToUtc(DateTime etLocal)
+        {
+            int offset = IsEtDstByLocalDate(etLocal) ? -4 : -5;
+            return etLocal.AddHours(-offset);
+        }
 
-            // --- 3. CALCULAR EL VOLUMEN DE LA ORDEN EN UNIDADES ---
-            double pipValue = Symbol.PipValue;
-            double volumeInUnits = riskAmountInUSD / (stopLossPips * pipValue);
+        private bool IsEtDstByLocalDate(DateTime etLocal)
+        {
+            int y = etLocal.Year;
+            var start = NthWeekdayOfMonth(y, 3, DayOfWeek.Sunday, 2).AddHours(2); // 2º dom marzo 02:00
+            var end   = NthWeekdayOfMonth(y, 11, DayOfWeek.Sunday, 1).AddHours(2); // 1º dom nov 02:00
+            return etLocal >= start && etLocal < end;
+        }
 
-            // --- 4. AJUSTAR EL VOLUMEN A UN VALOR VÁLIDO ---
-            double normalizedVolume = Symbol.NormalizeVolumeInUnits(volumeInUnits, RoundingMode.Down);
-
-            // Si el volumen no es válido, detenemos la ejecución.
-            if (normalizedVolume <= 0)
-            {
-                Print("ERROR: El volumen calculado es cero o negativo. No se puede ejecutar la orden.");
-                return;
-            }
-
-            // --- 5. CALCULAR LOS PRECIOS DE SL Y TP ---
-            double stopLossPrice;
-            if (tradeType == TradeType.Buy)
-                stopLossPrice = entryPrice - stopLossPriceDistance;
-            else
-                stopLossPrice = entryPrice + stopLossPriceDistance;
-
-            // El precio del Take Profit se calcula basado en el risk-reward.
-            double takeProfitPrice;
-            double takeProfitDistance = stopLossPriceDistance * RiskReward;
-
-            if (tradeType == TradeType.Buy)
-            {
-                takeProfitPrice = entryPrice + takeProfitDistance;
-            }
-            else
-            {
-                takeProfitPrice = entryPrice - takeProfitDistance;
-            }
-
-            // --- VERIFICACIONES DE SEGURIDAD ANTES DE EJECUTAR ---
-            if (double.IsNaN(stopLossPrice) || double.IsInfinity(stopLossPrice) ||
-                double.IsNaN(takeProfitPrice) || double.IsInfinity(takeProfitPrice))
-            {
-                Print("ERROR CRÍTICO: SL o TP calculados como valores no válidos. Cancelando la orden.");
-                return;
-            }
-
-            // cTrader requiere que el SL y el TP no sean idénticos al precio de entrada.
-            if (Math.Abs(stopLossPrice - entryPrice) < Symbol.PipSize ||
-                Math.Abs(takeProfitPrice - entryPrice) < Symbol.PipSize)
-            {
-                Print("ERROR CRÍTICO: El SL o TP están demasiado cerca del precio de entrada. Cancelando la orden.");
-                return;
-            }
-
-            ImprimirRiesgoUSD(normalizedVolume, Symbol.PipValue, stopLossPips);
-
-            // --- 6. EJECUTAR LA ORDEN Y ESTABLECER SL/TP ---
-            // Primero, ejecutamos la orden de mercado.
-            var result = ExecuteMarketOrder(tradeType, SymbolName, normalizedVolume, "ORB");
-
-            if (result.IsSuccessful)
-            {
-                Position position = result.Position;
-
-                // Verificamos que el objeto 'position' sea válido.
-                if (position == null)
-                {
-                    Print("ERROR: La posición se ejecutó, pero el objeto 'position' es nulo. ¡Posición en riesgo!");
-                    return;
-                }
-
-                // Intentamos establecer el SL y TP.
-                var modifyResult = ModifyPosition(position, stopLossPrice, takeProfitPrice);
-
-                // Si la modificación falla, lo intentamos de nuevo.
-                if (!modifyResult.IsSuccessful)
-                {
-                    Print("ADVERTENCIA: Primer intento de establecer SL/TP fallido. Reintentando...");
-
-                    // Reintentamos inmediatamente.
-                    modifyResult = ModifyPosition(position, stopLossPrice, takeProfitPrice);
-
-                    // Si el segundo intento falla, la posición está "desnuda" y es un riesgo.
-                    if (!modifyResult.IsSuccessful)
-                    {
-                        Print("ALERTA CRÍTICA: Segundo intento de SL/TP fallido. La posición está en riesgo. Cerrando de emergencia.");
-                        ClosePosition(position);
-                    }
-                    else
-                    {
-                        Print("SL/TP establecidos con éxito en el segundo intento.");
-                    }
-                }
-                else
-                {
-                    Print("Orden de {0} ejecutada con éxito. SL en {1}, TP en {2} establecidos.",
-                        tradeType, stopLossPrice, takeProfitPrice);
-                }
-            }
-            else
-            {
-                Print("Fallo al ejecutar la orden: " + result.Error);
-            }
+        private DateTime NthWeekdayOfMonth(int year, int month, DayOfWeek dow, int n)
+        {
+            var first = new DateTime(year, month, 1);
+            int offset = ((int)dow - (int)first.DayOfWeek + 7) % 7;
+            int day = 1 + offset + (n - 1) * 7;
+            return new DateTime(year, month, day);
         }
     }
 }
