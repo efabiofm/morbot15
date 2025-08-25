@@ -37,11 +37,21 @@ namespace cAlgo.Robots
         [Parameter("Límite de trades por día", DefaultValue = 2, MinValue = 0, MaxValue = 20)]
         public int DailyTradeLimit { get; set; }
 
-        [Parameter("Hora límite sin trades (ET, HH:mm)", DefaultValue = "11:00")]
+        [Parameter("Hora límite sin trades (ET, HH:mm)", DefaultValue = "10:30")]
         public string NoTradeAfterEtStr { get; set; }
 
         [Parameter("Etiqueta", DefaultValue = "BARSignalsTrader_CloseBar_Buffer")]
         public string LabelName { get; set; }
+
+        // --- Control de DD dinámico ---
+        [Parameter("Activar modo defensa DD", DefaultValue = true)]
+        public bool EnableDefensiveMode { get; set; }
+
+        [Parameter("Umbral DD Equity (%)", DefaultValue = 6.0, MinValue = 0.5, MaxValue = 20)]
+        public double DdThresholdPct { get; set; }
+
+        [Parameter("Riesgo % en defensa", DefaultValue = 1.0, MinValue = 0.1, MaxValue = 10)]
+        public double DefensiveRiskPercent { get; set; }
 
         // --- Estado ---
         private BARSignals _sig;
@@ -53,10 +63,19 @@ namespace cAlgo.Robots
         private readonly HashSet<long> _partialDone = new HashSet<long>();
         private int _tradesToday = 0;
 
+        // DD tracking
+        private double _maxEquity;
+        private double _ddPct;
+        private bool _defensiveMode;
+
         protected override void OnStart()
         {
             _sig = Indicators.GetIndicator<BARSignals>();
             _startedUtc = Server.Time;
+            _maxEquity = Account.Equity;
+            _ddPct = 0;
+            _defensiveMode = false;
+
             RecomputeSessionBounds(_startedUtc);
             Timer.Start(1);
         }
@@ -64,39 +83,41 @@ namespace cAlgo.Robots
         protected override void OnBar()
         {
             var nowUtc = Server.Time;
+            UpdateDrawdown();
+
+            // activar modo defensa si corresponde
+            if (EnableDefensiveMode && !_defensiveMode && _ddPct >= DdThresholdPct)
+                _defensiveMode = true;
 
             RecomputeSessionBounds(nowUtc);
 
             if (FlatAtSessionEnd && nowUtc >= _flattenUtc && HasOpenPosition())
                 CloseAllPositions();
 
-            var barCloseUtc = Bars.OpenTimes.Last(0); // cierre de la vela previa
+            var barCloseUtc = Bars.OpenTimes.Last(0);
             if (barCloseUtc < _startedUtc) return;
 
-            // Ventana sesión: [09:30 ET, 16:00 ET - buffer)
             if (OnlyNySession && (barCloseUtc < _orStartUtc || barCloseUtc >= _flattenUtc))
                 return;
 
-            // Cutoff: si no hubo trades antes de la hora límite, no abrir
             if (_tradesToday == 0 && barCloseUtc >= _cutoffUtc)
                 return;
 
-            // Límite diario
             if (DailyTradeLimit >= 0 && _tradesToday >= DailyTradeLimit)
                 return;
 
-            // Una sola posición
             if (HasOpenPosition()) return;
 
-            // Señal de la vela que acaba de cerrar
             bool buy  = _sig.BuySignal.Last(1)  == 1.0;
             bool sell = _sig.SellSignal.Last(1) == -1.0;
             if (!buy && !sell) return;
 
-            // Datos de la vela de señal (la que cerró)
             double barOpen  = Bars.OpenPrices.Last(1);
             double barHigh  = Bars.HighPrices.Last(1);
             double barLow   = Bars.LowPrices.Last(1);
+
+            // riesgo a usar según modo
+            double riskToUse = (_defensiveMode && EnableDefensiveMode) ? DefensiveRiskPercent : RiskPercent;
 
             if (buy)
             {
@@ -105,7 +126,7 @@ namespace cAlgo.Robots
                 int stopPips = PipsFrom(entry, stopPrice, TradeType.Buy);
                 if (stopPips <= 0) return;
 
-                double vol = VolumeForRisk(RiskPercent, stopPips);
+                double vol = VolumeForRisk(riskToUse, stopPips);
                 if (vol < Symbol.VolumeInUnitsMin) return;
 
                 int tpPips = (int)Math.Ceiling(stopPips * TpRR);
@@ -123,7 +144,7 @@ namespace cAlgo.Robots
                 int stopPips = PipsFrom(entry, stopPrice, TradeType.Sell);
                 if (stopPips <= 0) return;
 
-                double vol = VolumeForRisk(RiskPercent, stopPips);
+                double vol = VolumeForRisk(riskToUse, stopPips);
                 if (vol < Symbol.VolumeInUnitsMin) return;
 
                 int tpPips = (int)Math.Ceiling(stopPips * TpRR);
@@ -134,11 +155,19 @@ namespace cAlgo.Robots
                     _tradesToday++;
                 }
             }
+
+            // salida de modo defensa si el DD se reduce lo suficiente
+            if (EnableDefensiveMode && _defensiveMode && _ddPct < Math.Max(0.0, DdThresholdPct * 0.5))
+                _defensiveMode = false;
         }
 
         protected override void OnTick()
         {
-            // Parcial configurable al tick + mover SL a BE conservando TP
+            UpdateDrawdown();
+
+            if (EnableDefensiveMode && !_defensiveMode && _ddPct >= DdThresholdPct)
+                _defensiveMode = true;
+
             if (EnablePartial)
             {
                 var positions = Positions.FindAll(LabelName, SymbolName);
@@ -149,13 +178,11 @@ namespace cAlgo.Robots
 
                     if (ReachedRR(p, PartialRR))
                     {
-                        // cerrar 50%
                         double toClose = Symbol.NormalizeVolumeInUnits(p.VolumeInUnits * 0.5, RoundingMode.ToNearest);
                         if (toClose >= Symbol.VolumeInUnitsMin)
                             ClosePosition(p, toClose);
 
-                        // mover SL a BE y conservar TP existente
-                        double tpKeep = p.TakeProfit.HasValue ? p.TakeProfit.Value : p.EntryPrice; // fallback
+                        double tpKeep = p.TakeProfit.HasValue ? p.TakeProfit.Value : p.EntryPrice;
                         double slBE   = p.EntryPrice;
 
                         var mod = ModifyPosition(p, slBE, tpKeep);
@@ -166,7 +193,6 @@ namespace cAlgo.Robots
                 }
             }
 
-            // Flatten por buffer si aplica
             if (!FlatAtSessionEnd) return;
             var nowUtc = Server.Time;
             if (nowUtc >= _flattenUtc && HasOpenPosition())
@@ -182,6 +208,14 @@ namespace cAlgo.Robots
         }
 
         // --- Utilidades ---
+        private void UpdateDrawdown()
+        {
+            double eq = Account.Equity;
+            if (eq > _maxEquity) _maxEquity = eq;
+            if (_maxEquity > 0)
+                _ddPct = (_maxEquity - eq) / _maxEquity * 100.0;
+        }
+
         private bool ReachedRR(Position p, double rr)
         {
             double risk = RiskDistancePrice(p);
@@ -247,7 +281,6 @@ namespace cAlgo.Robots
                 _orStartEt = _currentEtDate.AddHours(9).AddMinutes(30);
                 _sessEndEt = _currentEtDate.AddHours(16);
 
-                // Parse hora límite desde string (HH:mm o HH:mm:ss). Default 11:00 si falla.
                 TimeSpan cutoffSpan;
                 if (!TimeSpan.TryParse(NoTradeAfterEtStr, out cutoffSpan))
                     cutoffSpan = new TimeSpan(11, 0, 0);
@@ -259,7 +292,6 @@ namespace cAlgo.Robots
                 _flattenUtc = EtToUtc(_sessEndEt.AddSeconds(-CloseBufferSeconds));
                 _cutoffUtc  = EtToUtc(_cutoffEt);
 
-                // reset diario
                 _tradesToday = 0;
                 _partialDone.Clear();
             }
@@ -280,8 +312,8 @@ namespace cAlgo.Robots
         private bool IsEtDstByLocalDate(DateTime etLocal)
         {
             int y = etLocal.Year;
-            var start = NthWeekdayOfMonth(y, 3, DayOfWeek.Sunday, 2).AddHours(2); // 2º dom marzo 02:00
-            var end   = NthWeekdayOfMonth(y, 11, DayOfWeek.Sunday, 1).AddHours(2); // 1º dom nov 02:00
+            var start = NthWeekdayOfMonth(y, 3, DayOfWeek.Sunday, 2).AddHours(2);
+            var end   = NthWeekdayOfMonth(y, 11, DayOfWeek.Sunday, 1).AddHours(2);
             return etLocal >= start && etLocal < end;
         }
 
