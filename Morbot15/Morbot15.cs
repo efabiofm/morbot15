@@ -10,7 +10,7 @@ namespace cAlgo.Robots
     public class BARSignalsTrader_CloseBar_Buffer : Robot
     {
         // --- Parámetros ---
-        [Parameter("Riesgo %", DefaultValue = 2.0, MinValue = 0.1, MaxValue = 10)]
+        [Parameter("Riesgo %", DefaultValue = 2.0, MinValue = 0.1)]
         public double RiskPercent { get; set; }
 
         [Parameter("Offset SL (pips)", DefaultValue = 20, MinValue = 0)]
@@ -19,49 +19,36 @@ namespace cAlgo.Robots
         [Parameter("TP en múltiplos de R", DefaultValue = 2.0, MinValue = 0.1)]
         public double TpRR { get; set; }
 
-        [Parameter("Tomar parcial en 1er objetivo", DefaultValue = true)]
-        public bool EnablePartial { get; set; }
-
-        [Parameter("Distancia 1er parcial (R)", DefaultValue = 1.0, MinValue = 0.1)]
+        [Parameter("Distancia 1er parcial (R)", DefaultValue = 0.0, MinValue = 0.0)]
         public double PartialRR { get; set; }
-
-        [Parameter("Operar solo sesión NY", DefaultValue = true)]
-        public bool OnlyNySession { get; set; }
 
         [Parameter("Cerrar al fin de sesión", DefaultValue = true)]
         public bool FlatAtSessionEnd { get; set; }
 
-        [Parameter("Buffer cierre (seg)", DefaultValue = 60, MinValue = 5, MaxValue = 900)]
-        public int CloseBufferSeconds { get; set; }
-
-        [Parameter("Límite de trades por día", DefaultValue = 2, MinValue = 0, MaxValue = 20)]
+        [Parameter("Límite de trades por día", DefaultValue = 1, MinValue = 0)]
         public int DailyTradeLimit { get; set; }
 
         [Parameter("Hora límite sin trades (ET, HH:mm)", DefaultValue = "10:30")]
         public string NoTradeAfterEtStr { get; set; }
 
-        [Parameter("Etiqueta", DefaultValue = "BARSignalsTrader_CloseBar_Buffer")]
-        public string LabelName { get; set; }
-
         // --- Control de DD dinámico ---
-        [Parameter("Activar modo defensa DD", DefaultValue = true)]
-        public bool EnableDefensiveMode { get; set; }
-
-        [Parameter("Umbral DD Equity (%)", DefaultValue = 6.0, MinValue = 0.5, MaxValue = 20)]
+        [Parameter("Umbral DD Equity (%)", DefaultValue = 0.0, MinValue = 0.0)]
         public double DdThresholdPct { get; set; }
 
-        [Parameter("Riesgo % en defensa", DefaultValue = 1.0, MinValue = 0.1, MaxValue = 10)]
+        [Parameter("Riesgo % en defensa", DefaultValue = 1.0, MinValue = 0.1)]
         public double DefensiveRiskPercent { get; set; }
 
         // --- Gestión de SL por R alcanzado ---
-        [Parameter("Mover SL al alcanzar (R)", DefaultValue = 1.5, MinValue = 0.0)]
+        [Parameter("Mover SL al alcanzar (R)", DefaultValue = 0.0, MinValue = 0.0)]
         public double MoveSlTriggerRR { get; set; }
 
         // 0 => BE; >0 => SL a +RR desde la ENTRADA (lado de ganancia)
-        [Parameter("Nuevo SL a (R)", DefaultValue = 0.5, MinValue = 0.0)]
+        [Parameter("Nuevo SL a (R)", DefaultValue = 0.0, MinValue = 0.0)]
         public double MoveSlToRR { get; set; }
 
         // --- Estado ---
+        private string _labelName = "BARSignalsTrader_CloseBar_Buffer";
+        private int _closeBufferSeconds = 60;
         private BARSignals _sig;
         private DateTime _currentEtDate = DateTime.MinValue;
         private DateTime _orStartEt, _sessEndEt, _cutoffEt;
@@ -73,6 +60,7 @@ namespace cAlgo.Robots
         private int _tradesToday = 0;
 
         // DD tracking
+        private bool _enableDefensiveMode;
         private double _maxEquity;
         private double _ddPct;
         private bool _defensiveMode;
@@ -83,6 +71,7 @@ namespace cAlgo.Robots
             _startedUtc = Server.Time;
             _maxEquity = Account.Equity;
             _ddPct = 0;
+            _enableDefensiveMode = DdThresholdPct > 0.0;
             _defensiveMode = false;
 
             RecomputeSessionBounds(_startedUtc);
@@ -94,7 +83,7 @@ namespace cAlgo.Robots
             var nowUtc = Server.Time;
             UpdateDrawdown();
 
-            if (EnableDefensiveMode && !_defensiveMode && _ddPct >= DdThresholdPct)
+            if (_enableDefensiveMode && !_defensiveMode && _ddPct >= DdThresholdPct)
                 _defensiveMode = true;
 
             RecomputeSessionBounds(nowUtc);
@@ -105,7 +94,7 @@ namespace cAlgo.Robots
             var barCloseUtc = Bars.OpenTimes.Last(0);
             if (barCloseUtc < _startedUtc) return;
 
-            if (OnlyNySession && (barCloseUtc < _orStartUtc || barCloseUtc >= _flattenUtc))
+            if (barCloseUtc < _orStartUtc || barCloseUtc >= _flattenUtc)
                 return;
 
             if (_tradesToday == 0 && barCloseUtc >= _cutoffUtc)
@@ -124,7 +113,7 @@ namespace cAlgo.Robots
             double barHigh  = Bars.HighPrices.Last(1);
             double barLow   = Bars.LowPrices.Last(1);
 
-            double riskToUse = (_defensiveMode && EnableDefensiveMode) ? DefensiveRiskPercent : RiskPercent;
+            double riskToUse = (_defensiveMode && _enableDefensiveMode) ? DefensiveRiskPercent : RiskPercent;
 
             if (buy)
             {
@@ -137,7 +126,7 @@ namespace cAlgo.Robots
                 if (vol < Symbol.VolumeInUnitsMin) return;
 
                 int tpPips = (int)Math.Ceiling(stopPips * TpRR);
-                var res = ExecuteMarketOrder(TradeType.Buy, SymbolName, vol, LabelName, stopPips, tpPips);
+                var res = ExecuteMarketOrder(TradeType.Buy, SymbolName, vol, _labelName, stopPips, tpPips);
                 if (res.IsSuccessful && res.Position != null)
                 {
                     _partialDone.Remove(res.Position.Id);
@@ -156,7 +145,7 @@ namespace cAlgo.Robots
                 if (vol < Symbol.VolumeInUnitsMin) return;
 
                 int tpPips = (int)Math.Ceiling(stopPips * TpRR);
-                var res = ExecuteMarketOrder(TradeType.Sell, SymbolName, vol, LabelName, stopPips, tpPips);
+                var res = ExecuteMarketOrder(TradeType.Sell, SymbolName, vol, _labelName, stopPips, tpPips);
                 if (res.IsSuccessful && res.Position != null)
                 {
                     _partialDone.Remove(res.Position.Id);
@@ -165,7 +154,7 @@ namespace cAlgo.Robots
                 }
             }
 
-            if (EnableDefensiveMode && _defensiveMode && _ddPct < Math.Max(0.0, DdThresholdPct * 0.5))
+            if (_enableDefensiveMode && _defensiveMode && _ddPct < Math.Max(0.0, DdThresholdPct * 0.5))
                 _defensiveMode = false;
         }
 
@@ -173,13 +162,13 @@ namespace cAlgo.Robots
         {
             UpdateDrawdown();
 
-            if (EnableDefensiveMode && !_defensiveMode && _ddPct >= DdThresholdPct)
+            if (_enableDefensiveMode && !_defensiveMode && _ddPct >= DdThresholdPct)
                 _defensiveMode = true;
 
             // --- Mover SL por R alcanzado ---
             if (MoveSlTriggerRR > 0.0)
             {
-                var positions = Positions.FindAll(LabelName, SymbolName);
+                var positions = Positions.FindAll(_labelName, SymbolName);
                 foreach (var p in positions)
                 {
                     if (p == null) continue;
@@ -211,9 +200,9 @@ namespace cAlgo.Robots
             }
 
             // --- Parcial en 1R (si aplica) ---
-            if (EnablePartial)
+            if (PartialRR > 0.0)
             {
-                var positions = Positions.FindAll(LabelName, SymbolName);
+                var positions = Positions.FindAll(_labelName, SymbolName);
                 foreach (var p in positions)
                 {
                     if (p == null || !p.StopLoss.HasValue) continue;
@@ -326,13 +315,13 @@ namespace cAlgo.Robots
 
         private bool HasOpenPosition()
         {
-            var positions = Positions.FindAll(LabelName, SymbolName);
+            var positions = Positions.FindAll(_labelName, SymbolName);
             return positions != null && positions.Length > 0;
         }
 
         private void CloseAllPositions()
         {
-            foreach (var p in Positions.FindAll(LabelName, SymbolName))
+            foreach (var p in Positions.FindAll(_labelName, SymbolName))
                 ClosePosition(p);
         }
 
@@ -354,7 +343,7 @@ namespace cAlgo.Robots
 
                 _orStartUtc = EtToUtc(_orStartEt);
                 _sessEndUtc = EtToUtc(_sessEndEt);
-                _flattenUtc = EtToUtc(_sessEndEt.AddSeconds(-CloseBufferSeconds));
+                _flattenUtc = EtToUtc(_sessEndEt.AddSeconds(-_closeBufferSeconds));
                 _cutoffUtc  = EtToUtc(_cutoffEt);
 
                 _tradesToday = 0;
