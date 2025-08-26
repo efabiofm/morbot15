@@ -53,6 +53,14 @@ namespace cAlgo.Robots
         [Parameter("Riesgo % en defensa", DefaultValue = 1.0, MinValue = 0.1, MaxValue = 10)]
         public double DefensiveRiskPercent { get; set; }
 
+        // --- Gestión de SL por R alcanzado ---
+        [Parameter("Mover SL al alcanzar (R)", DefaultValue = 1.5, MinValue = 0.0)]
+        public double MoveSlTriggerRR { get; set; }
+
+        // 0 => BE; >0 => SL a +RR desde la ENTRADA (lado de ganancia)
+        [Parameter("Nuevo SL a (R)", DefaultValue = 0.5, MinValue = 0.0)]
+        public double MoveSlToRR { get; set; }
+
         // --- Estado ---
         private BARSignals _sig;
         private DateTime _currentEtDate = DateTime.MinValue;
@@ -61,6 +69,7 @@ namespace cAlgo.Robots
         private DateTime _startedUtc;
 
         private readonly HashSet<long> _partialDone = new HashSet<long>();
+        private readonly HashSet<long> _slMovedByRR = new HashSet<long>();
         private int _tradesToday = 0;
 
         // DD tracking
@@ -85,7 +94,6 @@ namespace cAlgo.Robots
             var nowUtc = Server.Time;
             UpdateDrawdown();
 
-            // activar modo defensa si corresponde
             if (EnableDefensiveMode && !_defensiveMode && _ddPct >= DdThresholdPct)
                 _defensiveMode = true;
 
@@ -116,7 +124,6 @@ namespace cAlgo.Robots
             double barHigh  = Bars.HighPrices.Last(1);
             double barLow   = Bars.LowPrices.Last(1);
 
-            // riesgo a usar según modo
             double riskToUse = (_defensiveMode && EnableDefensiveMode) ? DefensiveRiskPercent : RiskPercent;
 
             if (buy)
@@ -134,6 +141,7 @@ namespace cAlgo.Robots
                 if (res.IsSuccessful && res.Position != null)
                 {
                     _partialDone.Remove(res.Position.Id);
+                    _slMovedByRR.Remove(res.Position.Id);
                     _tradesToday++;
                 }
             }
@@ -152,11 +160,11 @@ namespace cAlgo.Robots
                 if (res.IsSuccessful && res.Position != null)
                 {
                     _partialDone.Remove(res.Position.Id);
+                    _slMovedByRR.Remove(res.Position.Id);
                     _tradesToday++;
                 }
             }
 
-            // salida de modo defensa si el DD se reduce lo suficiente
             if (EnableDefensiveMode && _defensiveMode && _ddPct < Math.Max(0.0, DdThresholdPct * 0.5))
                 _defensiveMode = false;
         }
@@ -168,6 +176,41 @@ namespace cAlgo.Robots
             if (EnableDefensiveMode && !_defensiveMode && _ddPct >= DdThresholdPct)
                 _defensiveMode = true;
 
+            // --- Mover SL por R alcanzado ---
+            if (MoveSlTriggerRR > 0.0)
+            {
+                var positions = Positions.FindAll(LabelName, SymbolName);
+                foreach (var p in positions)
+                {
+                    if (p == null) continue;
+                    if (_slMovedByRR.Contains(p.Id)) continue;
+                    if (!p.StopLoss.HasValue) continue;
+
+                    double rrNow = CurrentRR(p);
+                    if (rrNow < MoveSlTriggerRR) continue;
+
+                    // 0 => BE; >0 => SL a +RR desde la ENTRADA (lado de ganancia)
+                    double targetRR = Math.Max(0.0, MoveSlToRR);
+                    double newSl = SlPriceAtRR(p, targetRR);
+
+                    // No empeorar SL
+                    if (p.TradeType == TradeType.Buy)
+                    {
+                        if (newSl <= p.StopLoss.Value) { _slMovedByRR.Add(p.Id); continue; }
+                    }
+                    else
+                    {
+                        if (newSl >= p.StopLoss.Value) { _slMovedByRR.Add(p.Id); continue; }
+                    }
+
+                    double? keepTp = p.TakeProfit.HasValue ? p.TakeProfit.Value : (double?)null;
+                    var mod = ModifyPosition(p, newSl, keepTp);
+                    if (!mod.IsSuccessful) Print("ModifyPosition mover SL por R falló: {0}", mod.Error);
+                    else _slMovedByRR.Add(p.Id);
+                }
+            }
+
+            // --- Parcial en 1R (si aplica) ---
             if (EnablePartial)
             {
                 var positions = Positions.FindAll(LabelName, SymbolName);
@@ -228,6 +271,28 @@ namespace cAlgo.Robots
             return p.TradeType == TradeType.Buy
                 ? Symbol.Bid >= target
                 : Symbol.Ask <= target;
+        }
+
+        private double CurrentRR(Position p)
+        {
+            double risk = RiskDistancePrice(p);
+            if (risk <= 0) return 0;
+
+            double cur = p.TradeType == TradeType.Buy ? Symbol.Bid : Symbol.Ask;
+            double reward = p.TradeType == TradeType.Buy ? (cur - p.EntryPrice) : (p.EntryPrice - cur);
+            return reward / risk;
+        }
+
+        // SL a +RR desde la ENTRADA (lado de ganancia). rr=0 => BE.
+        private double SlPriceAtRR(Position p, double rr)
+        {
+            double risk = RiskDistancePrice(p);
+            if (risk <= 0) return p.StopLoss ?? p.EntryPrice;
+
+            if (p.TradeType == TradeType.Buy)
+                return p.EntryPrice + rr * risk;   // por encima de la entrada
+            else
+                return p.EntryPrice - rr * risk;   // por debajo de la entrada
         }
 
         private double RiskDistancePrice(Position p)
@@ -294,6 +359,7 @@ namespace cAlgo.Robots
 
                 _tradesToday = 0;
                 _partialDone.Clear();
+                _slMovedByRR.Clear();
             }
         }
 
