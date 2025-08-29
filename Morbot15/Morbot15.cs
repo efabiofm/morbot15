@@ -105,8 +105,8 @@ namespace cAlgo.Robots
 
             if (HasOpenPosition()) return;
 
-            bool buy  = _sig.BuySignal.Last(1)  == 1.0;
-            bool sell = _sig.SellSignal.Last(1) == -1.0;
+            bool buy  = _sig.BuySignal.Last(1)  > 0;
+            bool sell = _sig.SellSignal.Last(1) > 0;
             if (!buy && !sell) return;
 
             double barOpen  = Bars.OpenPrices.Last(1);
