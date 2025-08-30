@@ -19,9 +19,6 @@ namespace cAlgo.Robots
         [Parameter("TP en múltiplos de R", DefaultValue = 2.0, MinValue = 0.1)]
         public double TpRR { get; set; }
 
-        [Parameter("Distancia 1er parcial (R)", DefaultValue = 0.0, MinValue = 0.0)]
-        public double PartialRR { get; set; }
-
         [Parameter("Cerrar al fin de sesión", DefaultValue = true)]
         public bool FlatAtSessionEnd { get; set; }
 
@@ -30,21 +27,6 @@ namespace cAlgo.Robots
 
         [Parameter("Hora límite sin trades (ET, HH:mm)", DefaultValue = "10:30")]
         public string NoTradeAfterEtStr { get; set; }
-
-        // --- Control de DD dinámico ---
-        [Parameter("Umbral DD Equity (%)", DefaultValue = 0.0, MinValue = 0.0)]
-        public double DdThresholdPct { get; set; }
-
-        [Parameter("Riesgo % en defensa", DefaultValue = 1.0, MinValue = 0.1)]
-        public double DefensiveRiskPercent { get; set; }
-
-        // --- Gestión de SL por R alcanzado ---
-        [Parameter("Mover SL al alcanzar (R)", DefaultValue = 0.0, MinValue = 0.0)]
-        public double MoveSlTriggerRR { get; set; }
-
-        // 0 => BE; >0 => SL a +RR desde la ENTRADA (lado de ganancia)
-        [Parameter("Nuevo SL a (R)", DefaultValue = 0.0, MinValue = 0.0)]
-        public double MoveSlToRR { get; set; }
 
         // --- Estado ---
         private string _labelName = "BARSignalsTrader_CloseBar_Buffer";
@@ -71,8 +53,6 @@ namespace cAlgo.Robots
             _startedUtc = Server.Time;
             _maxEquity = Account.Equity;
             _ddPct = 0;
-            _enableDefensiveMode = DdThresholdPct > 0.0;
-            _defensiveMode = false;
 
             RecomputeSessionBounds(_startedUtc);
             Timer.Start(1);
@@ -82,9 +62,6 @@ namespace cAlgo.Robots
         {
             var nowUtc = Server.Time;
             UpdateDrawdown();
-
-            if (_enableDefensiveMode && !_defensiveMode && _ddPct >= DdThresholdPct)
-                _defensiveMode = true;
 
             RecomputeSessionBounds(nowUtc);
 
@@ -113,8 +90,6 @@ namespace cAlgo.Robots
             double barHigh  = Bars.HighPrices.Last(1);
             double barLow   = Bars.LowPrices.Last(1);
 
-            double riskToUse = (_defensiveMode && _enableDefensiveMode) ? DefensiveRiskPercent : RiskPercent;
-
             if (buy)
             {
                 double entry = Symbol.Ask;
@@ -122,7 +97,7 @@ namespace cAlgo.Robots
                 int stopPips = PipsFrom(entry, stopPrice, TradeType.Buy);
                 if (stopPips <= 0) return;
 
-                double vol = VolumeForRisk(riskToUse, stopPips);
+                double vol = VolumeForRisk(stopPips);
                 if (vol < Symbol.VolumeInUnitsMin) return;
 
                 int tpPips = (int)Math.Ceiling(stopPips * TpRR);
@@ -141,7 +116,7 @@ namespace cAlgo.Robots
                 int stopPips = PipsFrom(entry, stopPrice, TradeType.Sell);
                 if (stopPips <= 0) return;
 
-                double vol = VolumeForRisk(riskToUse, stopPips);
+                double vol = VolumeForRisk(stopPips);
                 if (vol < Symbol.VolumeInUnitsMin) return;
 
                 int tpPips = (int)Math.Ceiling(stopPips * TpRR);
@@ -153,78 +128,11 @@ namespace cAlgo.Robots
                     _tradesToday++;
                 }
             }
-
-            if (_enableDefensiveMode && _defensiveMode && _ddPct < Math.Max(0.0, DdThresholdPct * 0.5))
-                _defensiveMode = false;
         }
 
         protected override void OnTick()
         {
             UpdateDrawdown();
-
-            if (_enableDefensiveMode && !_defensiveMode && _ddPct >= DdThresholdPct)
-                _defensiveMode = true;
-
-            // --- Mover SL por R alcanzado ---
-            if (MoveSlTriggerRR > 0.0)
-            {
-                var positions = Positions.FindAll(_labelName, SymbolName);
-                foreach (var p in positions)
-                {
-                    if (p == null) continue;
-                    if (_slMovedByRR.Contains(p.Id)) continue;
-                    if (!p.StopLoss.HasValue) continue;
-
-                    double rrNow = CurrentRR(p);
-                    if (rrNow < MoveSlTriggerRR) continue;
-
-                    // 0 => BE; >0 => SL a +RR desde la ENTRADA (lado de ganancia)
-                    double targetRR = Math.Max(0.0, MoveSlToRR);
-                    double newSl = SlPriceAtRR(p, targetRR);
-
-                    // No empeorar SL
-                    if (p.TradeType == TradeType.Buy)
-                    {
-                        if (newSl <= p.StopLoss.Value) { _slMovedByRR.Add(p.Id); continue; }
-                    }
-                    else
-                    {
-                        if (newSl >= p.StopLoss.Value) { _slMovedByRR.Add(p.Id); continue; }
-                    }
-
-                    double? keepTp = p.TakeProfit.HasValue ? p.TakeProfit.Value : (double?)null;
-                    var mod = ModifyPosition(p, newSl, keepTp);
-                    if (!mod.IsSuccessful) Print("ModifyPosition mover SL por R falló: {0}", mod.Error);
-                    else _slMovedByRR.Add(p.Id);
-                }
-            }
-
-            // --- Parcial en 1R (si aplica) ---
-            if (PartialRR > 0.0)
-            {
-                var positions = Positions.FindAll(_labelName, SymbolName);
-                foreach (var p in positions)
-                {
-                    if (p == null || !p.StopLoss.HasValue) continue;
-                    if (_partialDone.Contains(p.Id)) continue;
-
-                    if (ReachedRR(p, PartialRR))
-                    {
-                        double toClose = Symbol.NormalizeVolumeInUnits(p.VolumeInUnits * 0.5, RoundingMode.ToNearest);
-                        if (toClose >= Symbol.VolumeInUnitsMin)
-                            ClosePosition(p, toClose);
-
-                        double tpKeep = p.TakeProfit.HasValue ? p.TakeProfit.Value : p.EntryPrice;
-                        double slBE   = p.EntryPrice;
-
-                        var mod = ModifyPosition(p, slBE, tpKeep);
-                        if (!mod.IsSuccessful) Print("ModifyPosition fallo: {0}", mod.Error);
-
-                        _partialDone.Add(p.Id);
-                    }
-                }
-            }
-
             if (!FlatAtSessionEnd) return;
             var nowUtc = Server.Time;
             if (nowUtc >= _flattenUtc && HasOpenPosition())
@@ -300,9 +208,9 @@ namespace cAlgo.Robots
             return stopPips;
         }
 
-        private double VolumeForRisk(double riskPercent, int stopPips)
+        private double VolumeForRisk(int stopPips)
         {
-            double riskMoney = Account.Balance * (riskPercent / 100.0);
+            double riskMoney = Account.Balance * (RiskPercent / 100.0);
             if (stopPips <= 0 || Symbol.PipValue <= 0) return 0;
 
             double rawUnits = riskMoney / (stopPips * Symbol.PipValue);
