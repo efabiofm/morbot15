@@ -65,6 +65,9 @@ namespace cAlgo.Robots
         private double _ddPct;
         private bool _defensiveMode;
 
+        // --- M15 ---
+        private Bars _m15Bars;
+
         protected override void OnStart()
         {
             _sig = Indicators.GetIndicator<BARSignals>();
@@ -73,6 +76,8 @@ namespace cAlgo.Robots
             _ddPct = 0;
             _enableDefensiveMode = DdThresholdPct > 0.0;
             _defensiveMode = false;
+
+            _m15Bars = MarketData.GetBars(TimeFrame.Minute15);
 
             RecomputeSessionBounds(_startedUtc);
             Timer.Start(1);
@@ -105,9 +110,16 @@ namespace cAlgo.Robots
 
             if (HasOpenPosition()) return;
 
+            // Señales
             bool buy  = _sig.BuySignal.Last(1)  > 0;
             bool sell = _sig.SellSignal.Last(1) > 0;
             if (!buy && !sell) return;
+
+            // --- Filtro de estructura M15 ---
+            var bias = GetM15Bias();
+            if (bias == TradeType.Buy && !buy) return;
+            if (bias == TradeType.Sell && !sell) return;
+            if (bias == null) return; // sin tendencia clara, no se opera
 
             double barOpen  = Bars.OpenPrices.Last(1);
             double barHigh  = Bars.HighPrices.Last(1);
@@ -178,11 +190,9 @@ namespace cAlgo.Robots
                     double rrNow = CurrentRR(p);
                     if (rrNow < MoveSlTriggerRR) continue;
 
-                    // 0 => BE; >0 => SL a +RR desde la ENTRADA (lado de ganancia)
                     double targetRR = Math.Max(0.0, MoveSlToRR);
                     double newSl = SlPriceAtRR(p, targetRR);
 
-                    // No empeorar SL
                     if (p.TradeType == TradeType.Buy)
                     {
                         if (newSl <= p.StopLoss.Value) { _slMovedByRR.Add(p.Id); continue; }
@@ -239,7 +249,52 @@ namespace cAlgo.Robots
                 CloseAllPositions();
         }
 
-        // --- Utilidades ---
+        // --- Bias en M15 ---
+        private TradeType? GetM15Bias()
+        {
+            if (_m15Bars == null || _m15Bars.Count < 10) return null;
+
+            // Buscar últimos dos swing highs y lows
+            int len = _m15Bars.Count;
+            double lastHigh = 0, prevHigh = 0;
+            double lastLow = 0, prevLow = 0;
+
+            // swings simples: pivote con 2 velas a cada lado
+            for (int i = len - 3; i >= 2; i--)
+            {
+                double h = _m15Bars.HighPrices[i];
+                double l = _m15Bars.LowPrices[i];
+
+                bool isHigh = h > _m15Bars.HighPrices[i - 1] && h > _m15Bars.HighPrices[i - 2]
+                           && h > _m15Bars.HighPrices[i + 1] && h > _m15Bars.HighPrices[i + 2];
+                bool isLow  = l < _m15Bars.LowPrices[i - 1] && l < _m15Bars.LowPrices[i - 2]
+                           && l < _m15Bars.LowPrices[i + 1] && l < _m15Bars.LowPrices[i + 2];
+
+                if (isHigh && lastHigh == 0)
+                    lastHigh = h;
+                else if (isHigh && prevHigh == 0)
+                    prevHigh = h;
+
+                if (isLow && lastLow == 0)
+                    lastLow = l;
+                else if (isLow && prevLow == 0)
+                    prevLow = l;
+
+                if (lastHigh > 0 && prevHigh > 0 && lastLow > 0 && prevLow > 0)
+                    break;
+            }
+
+            if (lastHigh == 0 || prevHigh == 0 || lastLow == 0 || prevLow == 0)
+                return null;
+
+            bool up = lastHigh > prevHigh && lastLow > prevLow;
+            bool down = lastHigh < prevHigh && lastLow < prevLow;
+
+            if (up) return TradeType.Buy;
+            if (down) return TradeType.Sell;
+            return null;
+        }
+
         private void UpdateDrawdown()
         {
             double eq = Account.Equity;
