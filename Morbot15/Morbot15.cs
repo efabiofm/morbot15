@@ -3,6 +3,7 @@ using cAlgo.API.Internals;
 using cAlgo.Indicators;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 
 namespace cAlgo.Robots
 {
@@ -38,13 +39,11 @@ namespace cAlgo.Robots
         [Parameter("Riesgo % en defensa", DefaultValue = 1.0, MinValue = 0.1)]
         public double DefensiveRiskPercent { get; set; }
 
-        // --- Gestión de SL por R alcanzado ---
-        [Parameter("Mover SL al alcanzar (R)", DefaultValue = 0.0, MinValue = 0.0)]
-        public double MoveSlTriggerRR { get; set; }
-
-        // 0 => BE; >0 => SL a +RR desde la ENTRADA (lado de ganancia)
-        [Parameter("Nuevo SL a (R)", DefaultValue = 0.0, MinValue = 0.0)]
-        public double MoveSlToRR { get; set; }
+        // --- NUEVO: Tramos RR vía string ---
+        // Formato: "trigger1,to1,trigger2,to2,..."
+        // Ej: "2,0,3,2,3.5,3"
+        [Parameter("RR Tracts (trigger,to,...)", DefaultValue = "")]
+        public string RrStepsStr { get; set; }
 
         // --- Estado ---
         private string _labelName = "BARSignalsTrader_CloseBar_Buffer";
@@ -56,7 +55,7 @@ namespace cAlgo.Robots
         private DateTime _startedUtc;
 
         private readonly HashSet<long> _partialDone = new HashSet<long>();
-        private readonly HashSet<long> _slMovedByRR = new HashSet<long>();
+        private readonly HashSet<long> _slMovedByRR = new HashSet<long>(); // legacy 1 tramo
         private int _tradesToday = 0;
 
         // DD tracking
@@ -64,6 +63,15 @@ namespace cAlgo.Robots
         private double _maxEquity;
         private double _ddPct;
         private bool _defensiveMode;
+
+        // Riesgo inicial y progreso de tramos
+        private readonly Dictionary<long, double> _initRiskByPos = new Dictionary<long, double>();
+        private readonly Dictionary<long, int> _rrStepAppliedIndex = new Dictionary<long, int>(); // -1 si ninguno
+
+        // Tramos parseados
+        private struct RrStep { public double Trigger; public double To; }
+        private List<RrStep> _rrSteps = new List<RrStep>();
+        private string _rrStepsRaw = null;
 
         protected override void OnStart()
         {
@@ -75,6 +83,7 @@ namespace cAlgo.Robots
             _defensiveMode = false;
 
             RecomputeSessionBounds(_startedUtc);
+            ParseRrStepsIfChanged();
             Timer.Start(1);
         }
 
@@ -129,8 +138,11 @@ namespace cAlgo.Robots
                 var res = ExecuteMarketOrder(TradeType.Buy, SymbolName, vol, _labelName, stopPips, tpPips);
                 if (res.IsSuccessful && res.Position != null)
                 {
-                    _partialDone.Remove(res.Position.Id);
-                    _slMovedByRR.Remove(res.Position.Id);
+                    var p = res.Position;
+                    StoreInitialRisk(p);
+                    _rrStepAppliedIndex[p.Id] = -1;
+                    _partialDone.Remove(p.Id);
+                    _slMovedByRR.Remove(p.Id);
                     _tradesToday++;
                 }
             }
@@ -148,8 +160,11 @@ namespace cAlgo.Robots
                 var res = ExecuteMarketOrder(TradeType.Sell, SymbolName, vol, _labelName, stopPips, tpPips);
                 if (res.IsSuccessful && res.Position != null)
                 {
-                    _partialDone.Remove(res.Position.Id);
-                    _slMovedByRR.Remove(res.Position.Id);
+                    var p = res.Position;
+                    StoreInitialRisk(p);
+                    _rrStepAppliedIndex[p.Id] = -1;
+                    _partialDone.Remove(p.Id);
+                    _slMovedByRR.Remove(p.Id);
                     _tradesToday++;
                 }
             }
@@ -165,44 +180,55 @@ namespace cAlgo.Robots
             if (_enableDefensiveMode && !_defensiveMode && _ddPct >= DdThresholdPct)
                 _defensiveMode = true;
 
-            // --- Mover SL por R alcanzado ---
-            if (MoveSlTriggerRR > 0.0)
+            ParseRrStepsIfChanged();
+
+            var positions = Positions.FindAll(_labelName, SymbolName);
+
+            // --- NUEVO: múltiples tramos desde string ---
+            if (_rrSteps.Count > 0)
             {
-                var positions = Positions.FindAll(_labelName, SymbolName);
                 foreach (var p in positions)
                 {
-                    if (p == null) continue;
-                    if (_slMovedByRR.Contains(p.Id)) continue;
-                    if (!p.StopLoss.HasValue) continue;
+                    if (p == null || !p.StopLoss.HasValue) continue;
 
                     double rrNow = CurrentRR(p);
-                    if (rrNow < MoveSlTriggerRR) continue;
+                    if (!_rrStepAppliedIndex.ContainsKey(p.Id)) _rrStepAppliedIndex[p.Id] = -1;
 
-                    // 0 => BE; >0 => SL a +RR desde la ENTRADA (lado de ganancia)
-                    double targetRR = Math.Max(0.0, MoveSlToRR);
-                    double newSl = SlPriceAtRR(p, targetRR);
+                    int lastApplied = _rrStepAppliedIndex[p.Id];
+                    int targetIdx = lastApplied;
 
-                    // No empeorar SL
-                    if (p.TradeType == TradeType.Buy)
+                    // encuentra el tramo más alto alcanzado
+                    for (int i = lastApplied + 1; i < _rrSteps.Count; i++)
                     {
-                        if (newSl <= p.StopLoss.Value) { _slMovedByRR.Add(p.Id); continue; }
-                    }
-                    else
-                    {
-                        if (newSl >= p.StopLoss.Value) { _slMovedByRR.Add(p.Id); continue; }
+                        if (rrNow >= _rrSteps[i].Trigger) targetIdx = i;
+                        else break;
                     }
 
-                    double? keepTp = p.TakeProfit.HasValue ? p.TakeProfit.Value : (double?)null;
-                    var mod = ModifyPosition(p, newSl, keepTp);
-                    if (!mod.IsSuccessful) Print("ModifyPosition mover SL por R falló: {0}", mod.Error);
-                    else _slMovedByRR.Add(p.Id);
+                    if (targetIdx > lastApplied)
+                    {
+                        double newSl = SlPriceAtRR(p, Math.Max(0.0, _rrSteps[targetIdx].To));
+
+                        bool improves = p.TradeType == TradeType.Buy
+                            ? newSl > p.StopLoss.Value
+                            : newSl < p.StopLoss.Value;
+
+                        if (improves)
+                        {
+                            double? keepTp = p.TakeProfit.HasValue ? p.TakeProfit.Value : (double?)null;
+                            var mod = ModifyPosition(p, newSl, keepTp);
+                            if (!mod.IsSuccessful)
+                                Print("ModifyPosition (RR tramo idx {0}) falló: {1}", targetIdx, mod.Error);
+                        }
+
+                        // Marcar como aplicado aunque no mejore (por redondeo), para no reintentar cada tick
+                        _rrStepAppliedIndex[p.Id] = targetIdx;
+                    }
                 }
             }
 
             // --- Parcial en 1R (si aplica) ---
             if (PartialRR > 0.0)
             {
-                var positions = Positions.FindAll(_labelName, SymbolName);
                 foreach (var p in positions)
                 {
                     if (p == null || !p.StopLoss.HasValue) continue;
@@ -218,7 +244,7 @@ namespace cAlgo.Robots
                         double slBE   = p.EntryPrice;
 
                         var mod = ModifyPosition(p, slBE, tpKeep);
-                        if (!mod.IsSuccessful) Print("ModifyPosition fallo: {0}", mod.Error);
+                        if (!mod.IsSuccessful) Print("ModifyPosition (parcial) falló: {0}", mod.Error);
 
                         _partialDone.Add(p.Id);
                     }
@@ -239,6 +265,16 @@ namespace cAlgo.Robots
                 CloseAllPositions();
         }
 
+        // Limpieza de estado por posición cerrada
+        protected override void OnPositionClosed(Position position)
+        {
+            if (position == null) return;
+            _initRiskByPos.Remove(position.Id);
+            _rrStepAppliedIndex.Remove(position.Id);
+            _partialDone.Remove(position.Id);
+            _slMovedByRR.Remove(position.Id);
+        }
+
         // --- Utilidades ---
         private void UpdateDrawdown()
         {
@@ -248,9 +284,10 @@ namespace cAlgo.Robots
                 _ddPct = (_maxEquity - eq) / _maxEquity * 100.0;
         }
 
+        // Todas estas usan riesgo inicial si existe
         private bool ReachedRR(Position p, double rr)
         {
-            double risk = RiskDistancePrice(p);
+            double risk = BaseRisk(p);
             if (risk <= 0) return false;
 
             double target = p.TradeType == TradeType.Buy
@@ -264,7 +301,7 @@ namespace cAlgo.Robots
 
         private double CurrentRR(Position p)
         {
-            double risk = RiskDistancePrice(p);
+            double risk = BaseRisk(p);
             if (risk <= 0) return 0;
 
             double cur = p.TradeType == TradeType.Buy ? Symbol.Bid : Symbol.Ask;
@@ -272,16 +309,35 @@ namespace cAlgo.Robots
             return reward / risk;
         }
 
-        // SL a +RR desde la ENTRADA (lado de ganancia). rr=0 => BE.
+        // SL a +RR desde la ENTRADA (lado de ganancia). rr=0 => BE. Usa riesgo inicial si existe.
         private double SlPriceAtRR(Position p, double rr)
         {
-            double risk = RiskDistancePrice(p);
+            double risk = BaseRisk(p);
             if (risk <= 0) return p.StopLoss ?? p.EntryPrice;
 
             if (p.TradeType == TradeType.Buy)
                 return p.EntryPrice + rr * risk;   // por encima de la entrada
             else
                 return p.EntryPrice - rr * risk;   // por debajo de la entrada
+        }
+
+        // Riesgo “base”: inicial si lo tenemos; si no, cae al SL actual (último recurso)
+        private double BaseRisk(Position p)
+        {
+            double r;
+            if (_initRiskByPos.TryGetValue(p.Id, out r) && r > 0) return r;
+            return RiskDistancePrice(p);
+        }
+
+        private void StoreInitialRisk(Position p)
+        {
+            if (p == null || !p.StopLoss.HasValue) return;
+            double r = p.TradeType == TradeType.Buy
+                ? p.EntryPrice - p.StopLoss.Value
+                : p.StopLoss.Value - p.EntryPrice;
+
+            if (r > 0)
+                _initRiskByPos[p.Id] = r;
         }
 
         private double RiskDistancePrice(Position p)
@@ -349,6 +405,7 @@ namespace cAlgo.Robots
                 _tradesToday = 0;
                 _partialDone.Clear();
                 _slMovedByRR.Clear();
+                // No limpiamos _initRiskByPos/_rrStepAppliedIndex aquí porque puede haber posiciones abiertas que sobrevivan al día si FlatAtSessionEnd=false
             }
         }
 
@@ -378,6 +435,27 @@ namespace cAlgo.Robots
             int offset = ((int)dow - (int)first.DayOfWeek + 7) % 7;
             int day = 1 + offset + (n - 1) * 7;
             return new DateTime(year, month, day);
+        }
+
+        private void ParseRrStepsIfChanged()
+        {
+            if (_rrStepsRaw == RrStepsStr) return;
+            _rrStepsRaw = RrStepsStr;
+            _rrSteps.Clear();
+
+            if (string.IsNullOrWhiteSpace(RrStepsStr)) return;
+
+            var parts = RrStepsStr.Split(',');
+            for (int i = 0; i + 1 < parts.Length; i += 2)
+            {
+                double trig, to;
+                if (double.TryParse(parts[i].Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out trig) &&
+                    double.TryParse(parts[i + 1].Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out to))
+                {
+                    if (trig >= 0 && to >= 0)
+                        _rrSteps.Add(new RrStep { Trigger = trig, To = to });
+                }
+            }
         }
     }
 }
