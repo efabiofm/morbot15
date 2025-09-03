@@ -7,55 +7,54 @@ using System.Globalization;
 
 namespace cAlgo.Robots
 {
+    public enum StructureFilterMode { Disabled, Fixed, Auto }
+
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
     public class BARSignalsTrader_CloseBar_Buffer : Robot
     {
         // --- Parámetros ---
-        [Parameter("Riesgo %", DefaultValue = 2.0, MinValue = 0.1)]
+        [Parameter("Risk Per Trade (%)", DefaultValue = 2.0, MinValue = 0.1)]
         public double RiskPercent { get; set; }
 
-        [Parameter("Offset SL (pips)", DefaultValue = 20, MinValue = 0)]
+        [Parameter("SL Offset (pips)", DefaultValue = 20, MinValue = 0)]
         public int ExtraSLPips { get; set; }
 
-        [Parameter("TP en múltiplos de R", DefaultValue = 2.0, MinValue = 0.1)]
+        [Parameter("TP Distance (R)", DefaultValue = 2.0, MinValue = 0.1)]
         public double TpRR { get; set; }
 
-        [Parameter("Distancia 1er parcial (R)", DefaultValue = 0.0, MinValue = 0.0)]
-        public double PartialRR { get; set; }
-
-        [Parameter("Cerrar al fin de sesión", DefaultValue = true)]
-        public bool FlatAtSessionEnd { get; set; }
-
-        [Parameter("Límite de trades por día", DefaultValue = 1, MinValue = 0)]
-        public int DailyTradeLimit { get; set; }
-
-        [Parameter("Hora límite sin trades (ET, HH:mm)", DefaultValue = "10:30")]
-        public string NoTradeAfterEtStr { get; set; }
-
-        // --- Control de DD dinámico ---
-        [Parameter("Umbral DD Equity (%)", DefaultValue = 0.0, MinValue = 0.0)]
+        [Parameter("DD Threshold (%)", DefaultValue = 0.0, MinValue = 0.0)]
         public double DdThresholdPct { get; set; }
 
-        [Parameter("Riesgo % en defensa", DefaultValue = 1.0, MinValue = 0.1)]
+        [Parameter("Defensive Risk (%)", DefaultValue = 1.0, MinValue = 0.1)]
         public double DefensiveRiskPercent { get; set; }
 
-        // --- NUEVO: Tramos RR vía string ---
-        // Formato: "trigger1,to1,trigger2,to2,..."
-        // Ej: "2,0,3,2,3.5,3"
-        [Parameter("RR Tracts (trigger,to,...)", DefaultValue = "")]
+        [Parameter("Market Structure Filter", DefaultValue = true)]
+        public StructureFilterMode UseStructureFilter { get; set; }
+
+        [Parameter("RR Tracts", DefaultValue = "")]
         public string RrStepsStr { get; set; }
 
+        // Constantes
+        private const string LabelName = "BARSignalsTrader_CloseBar_Buffer";
+        private const string NoTradeAfterEtStr = "11:00";
+        private const bool CloseAtSessionEnd = true;
+        private const int DailyTradeLimit = 1;
+        private const int CloseBufferSeconds = 60;
+        private const int StructureTfMin = 1;
+        private const int SwingPivot = 5;
+        private const int StructureMaxLookback = 100;
+        private const int AtrDays = 20;
+        private const double AtrPctThreshold = 1.5;
+        private const int AtrPctSmaPeriod = 60;
+        private const double AtrRatioThreshold = 0.9;
+
         // --- Estado ---
-        private string _labelName = "BARSignalsTrader_CloseBar_Buffer";
-        private int _closeBufferSeconds = 60;
         private BARSignals _sig;
         private DateTime _currentEtDate = DateTime.MinValue;
         private DateTime _orStartEt, _sessEndEt, _cutoffEt;
         private DateTime _orStartUtc, _sessEndUtc, _flattenUtc, _cutoffUtc;
         private DateTime _startedUtc;
-
-        private readonly HashSet<long> _partialDone = new HashSet<long>();
-        private readonly HashSet<long> _slMovedByRR = new HashSet<long>(); // legacy 1 tramo
+        private Bars _d1Bars;
         private int _tradesToday = 0;
 
         // DD tracking
@@ -73,6 +72,9 @@ namespace cAlgo.Robots
         private List<RrStep> _rrSteps = new List<RrStep>();
         private string _rrStepsRaw = null;
 
+        // Series para estructura ---
+        private Bars _structBars;
+
         protected override void OnStart()
         {
             _sig = Indicators.GetIndicator<BARSignals>();
@@ -81,6 +83,10 @@ namespace cAlgo.Robots
             _ddPct = 0;
             _enableDefensiveMode = DdThresholdPct > 0.0;
             _defensiveMode = false;
+            _d1Bars = MarketData.GetBars(TimeFrame.Daily);
+
+            // Timeframe para estructura
+            _structBars = MarketData.GetBars(TfFromMinutes(StructureTfMin));
 
             RecomputeSessionBounds(_startedUtc);
             ParseRrStepsIfChanged();
@@ -97,7 +103,7 @@ namespace cAlgo.Robots
 
             RecomputeSessionBounds(nowUtc);
 
-            if (FlatAtSessionEnd && nowUtc >= _flattenUtc && HasOpenPosition())
+            if (CloseAtSessionEnd && nowUtc >= _flattenUtc && HasOpenPosition())
                 CloseAllPositions();
 
             var barCloseUtc = Bars.OpenTimes.Last(0);
@@ -114,13 +120,25 @@ namespace cAlgo.Robots
 
             if (HasOpenPosition()) return;
 
-            bool buy  = _sig.BuySignal.Last(1)  > 0;
+            bool buy = _sig.BuySignal.Last(1) > 0;
             bool sell = _sig.SellSignal.Last(1) > 0;
             if (!buy && !sell) return;
 
-            double barOpen  = Bars.OpenPrices.Last(1);
-            double barHigh  = Bars.HighPrices.Last(1);
-            double barLow   = Bars.LowPrices.Last(1);
+            // --- Filtro estructura MTF ---
+            bool applyStruct = ShouldUseStructureFilter();
+            if (applyStruct)
+            {
+                bool up, down;
+                if (!GetStructureTrend(out up, out down))
+                    return; // no hay datos suficientes de estructura
+
+                if (buy && !up) return;
+                if (sell && !down) return;
+            }
+
+            double barOpen = Bars.OpenPrices.Last(1);
+            double barHigh = Bars.HighPrices.Last(1);
+            double barLow = Bars.LowPrices.Last(1);
 
             double riskToUse = (_defensiveMode && _enableDefensiveMode) ? DefensiveRiskPercent : RiskPercent;
 
@@ -135,14 +153,12 @@ namespace cAlgo.Robots
                 if (vol < Symbol.VolumeInUnitsMin) return;
 
                 int tpPips = (int)Math.Ceiling(stopPips * TpRR);
-                var res = ExecuteMarketOrder(TradeType.Buy, SymbolName, vol, _labelName, stopPips, tpPips);
+                var res = ExecuteMarketOrder(TradeType.Buy, SymbolName, vol, LabelName, stopPips, tpPips);
                 if (res.IsSuccessful && res.Position != null)
                 {
                     var p = res.Position;
                     StoreInitialRisk(p);
                     _rrStepAppliedIndex[p.Id] = -1;
-                    _partialDone.Remove(p.Id);
-                    _slMovedByRR.Remove(p.Id);
                     _tradesToday++;
                 }
             }
@@ -157,14 +173,12 @@ namespace cAlgo.Robots
                 if (vol < Symbol.VolumeInUnitsMin) return;
 
                 int tpPips = (int)Math.Ceiling(stopPips * TpRR);
-                var res = ExecuteMarketOrder(TradeType.Sell, SymbolName, vol, _labelName, stopPips, tpPips);
+                var res = ExecuteMarketOrder(TradeType.Sell, SymbolName, vol, LabelName, stopPips, tpPips);
                 if (res.IsSuccessful && res.Position != null)
                 {
                     var p = res.Position;
                     StoreInitialRisk(p);
                     _rrStepAppliedIndex[p.Id] = -1;
-                    _partialDone.Remove(p.Id);
-                    _slMovedByRR.Remove(p.Id);
                     _tradesToday++;
                 }
             }
@@ -182,9 +196,9 @@ namespace cAlgo.Robots
 
             ParseRrStepsIfChanged();
 
-            var positions = Positions.FindAll(_labelName, SymbolName);
+            var positions = Positions.FindAll(LabelName, SymbolName);
 
-            // --- NUEVO: múltiples tramos desde string ---
+            // --- múltiples tramos desde string ---
             if (_rrSteps.Count > 0)
             {
                 foreach (var p in positions)
@@ -197,7 +211,6 @@ namespace cAlgo.Robots
                     int lastApplied = _rrStepAppliedIndex[p.Id];
                     int targetIdx = lastApplied;
 
-                    // encuentra el tramo más alto alcanzado
                     for (int i = lastApplied + 1; i < _rrSteps.Count; i++)
                     {
                         if (rrNow >= _rrSteps[i].Trigger) targetIdx = i;
@@ -207,10 +220,7 @@ namespace cAlgo.Robots
                     if (targetIdx > lastApplied)
                     {
                         double newSl = SlPriceAtRR(p, Math.Max(0.0, _rrSteps[targetIdx].To));
-
-                        bool improves = p.TradeType == TradeType.Buy
-                            ? newSl > p.StopLoss.Value
-                            : newSl < p.StopLoss.Value;
+                        bool improves = p.TradeType == TradeType.Buy ? newSl > p.StopLoss.Value : newSl < p.StopLoss.Value;
 
                         if (improves)
                         {
@@ -219,39 +229,12 @@ namespace cAlgo.Robots
                             if (!mod.IsSuccessful)
                                 Print("ModifyPosition (RR tramo idx {0}) falló: {1}", targetIdx, mod.Error);
                         }
-
-                        // Marcar como aplicado aunque no mejore (por redondeo), para no reintentar cada tick
                         _rrStepAppliedIndex[p.Id] = targetIdx;
                     }
                 }
             }
 
-            // --- Parcial en 1R (si aplica) ---
-            if (PartialRR > 0.0)
-            {
-                foreach (var p in positions)
-                {
-                    if (p == null || !p.StopLoss.HasValue) continue;
-                    if (_partialDone.Contains(p.Id)) continue;
-
-                    if (ReachedRR(p, PartialRR))
-                    {
-                        double toClose = Symbol.NormalizeVolumeInUnits(p.VolumeInUnits * 0.5, RoundingMode.ToNearest);
-                        if (toClose >= Symbol.VolumeInUnitsMin)
-                            ClosePosition(p, toClose);
-
-                        double tpKeep = p.TakeProfit.HasValue ? p.TakeProfit.Value : p.EntryPrice;
-                        double slBE   = p.EntryPrice;
-
-                        var mod = ModifyPosition(p, slBE, tpKeep);
-                        if (!mod.IsSuccessful) Print("ModifyPosition (parcial) falló: {0}", mod.Error);
-
-                        _partialDone.Add(p.Id);
-                    }
-                }
-            }
-
-            if (!FlatAtSessionEnd) return;
+            if (!CloseAtSessionEnd) return;
             var nowUtc = Server.Time;
             if (nowUtc >= _flattenUtc && HasOpenPosition())
                 CloseAllPositions();
@@ -259,7 +242,7 @@ namespace cAlgo.Robots
 
         protected override void OnTimer()
         {
-            if (!FlatAtSessionEnd) return;
+            if (!CloseAtSessionEnd) return;
             var nowUtc = Server.Time;
             if (nowUtc >= _flattenUtc && HasOpenPosition())
                 CloseAllPositions();
@@ -271,8 +254,6 @@ namespace cAlgo.Robots
             if (position == null) return;
             _initRiskByPos.Remove(position.Id);
             _rrStepAppliedIndex.Remove(position.Id);
-            _partialDone.Remove(position.Id);
-            _slMovedByRR.Remove(position.Id);
         }
 
         // --- Utilidades ---
@@ -284,7 +265,6 @@ namespace cAlgo.Robots
                 _ddPct = (_maxEquity - eq) / _maxEquity * 100.0;
         }
 
-        // Todas estas usan riesgo inicial si existe
         private bool ReachedRR(Position p, double rr)
         {
             double risk = BaseRisk(p);
@@ -309,19 +289,17 @@ namespace cAlgo.Robots
             return reward / risk;
         }
 
-        // SL a +RR desde la ENTRADA (lado de ganancia). rr=0 => BE. Usa riesgo inicial si existe.
         private double SlPriceAtRR(Position p, double rr)
         {
             double risk = BaseRisk(p);
             if (risk <= 0) return p.StopLoss ?? p.EntryPrice;
 
             if (p.TradeType == TradeType.Buy)
-                return p.EntryPrice + rr * risk;   // por encima de la entrada
+                return p.EntryPrice + rr * risk;
             else
-                return p.EntryPrice - rr * risk;   // por debajo de la entrada
+                return p.EntryPrice - rr * risk;
         }
 
-        // Riesgo “base”: inicial si lo tenemos; si no, cae al SL actual (último recurso)
         private double BaseRisk(Position p)
         {
             double r;
@@ -371,13 +349,13 @@ namespace cAlgo.Robots
 
         private bool HasOpenPosition()
         {
-            var positions = Positions.FindAll(_labelName, SymbolName);
+            var positions = Positions.FindAll(LabelName, SymbolName);
             return positions != null && positions.Length > 0;
         }
 
         private void CloseAllPositions()
         {
-            foreach (var p in Positions.FindAll(_labelName, SymbolName))
+            foreach (var p in Positions.FindAll(LabelName, SymbolName))
                 ClosePosition(p);
         }
 
@@ -395,17 +373,14 @@ namespace cAlgo.Robots
                 if (!TimeSpan.TryParse(NoTradeAfterEtStr, out cutoffSpan))
                     cutoffSpan = new TimeSpan(11, 0, 0);
 
-                _cutoffEt  = _currentEtDate + cutoffSpan;
+                _cutoffEt = _currentEtDate + cutoffSpan;
 
                 _orStartUtc = EtToUtc(_orStartEt);
                 _sessEndUtc = EtToUtc(_sessEndEt);
-                _flattenUtc = EtToUtc(_sessEndEt.AddSeconds(-_closeBufferSeconds));
-                _cutoffUtc  = EtToUtc(_cutoffEt);
+                _flattenUtc = EtToUtc(_sessEndEt.AddSeconds(-CloseBufferSeconds));
+                _cutoffUtc = EtToUtc(_cutoffEt);
 
                 _tradesToday = 0;
-                _partialDone.Clear();
-                _slMovedByRR.Clear();
-                // No limpiamos _initRiskByPos/_rrStepAppliedIndex aquí porque puede haber posiciones abiertas que sobrevivan al día si FlatAtSessionEnd=false
             }
         }
 
@@ -425,7 +400,7 @@ namespace cAlgo.Robots
         {
             int y = etLocal.Year;
             var start = NthWeekdayOfMonth(y, 3, DayOfWeek.Sunday, 2).AddHours(2);
-            var end   = NthWeekdayOfMonth(y, 11, DayOfWeek.Sunday, 1).AddHours(2);
+            var end = NthWeekdayOfMonth(y, 11, DayOfWeek.Sunday, 1).AddHours(2);
             return etLocal >= start && etLocal < end;
         }
 
@@ -456,6 +431,213 @@ namespace cAlgo.Robots
                         _rrSteps.Add(new RrStep { Trigger = trig, To = to });
                 }
             }
+        }
+
+        // =========================
+        // ESTRUCTURA MTF
+        // =========================
+        private bool GetStructureTrend(out bool uptrend, out bool downtrend)
+        {
+            uptrend = false;
+            downtrend = false;
+
+            if (_structBars == null || _structBars.Count < 2 * (SwingPivot + 1) + 5)
+                return false;
+
+            int lastClosed = _structBars.Count - 2; // última barra cerrada en TF estructura
+            if (lastClosed < SwingPivot + 1) return false;
+
+            // obtener últimos 2 pivot highs y 2 pivot lows confirmados
+            double h1, h2, l1, l2;
+            bool okH = TryGetLastTwoPivots(_structBars, lastClosed, SwingPivot, true, out h1, out h2);
+            bool okL = TryGetLastTwoPivots(_structBars, lastClosed, SwingPivot, false, out l1, out l2);
+            if (!okH || !okL) return false;
+
+            uptrend = (h1 > h2) && (l1 > l2);
+            downtrend = (h1 < h2) && (l1 < l2);
+            return true;
+        }
+
+        private bool TryGetLastTwoPivots(Bars b, int fromIdx, int L, bool high, out double p1, out double p2)
+        {
+            p1 = 0; p2 = 0;
+            int found = 0;
+            int start = Math.Max(L, fromIdx - StructureMaxLookback);
+            int end = fromIdx - L;
+
+            for (int i = end; i >= start; i--)
+            {
+                if (IsPivot(b, i, L, high))
+                {
+                    if (found == 0) { p1 = high ? b.HighPrices[i] : b.LowPrices[i]; found = 1; }
+                    else { p2 = high ? b.HighPrices[i] : b.LowPrices[i]; return true; }
+                }
+            }
+            return false;
+        }
+
+        private bool IsPivot(Bars b, int i, int L, bool high)
+        {
+            if (i - L < 0 || i + L >= b.Count) return false;
+
+            if (high)
+            {
+                double val = b.HighPrices[i];
+                for (int k = i - L; k <= i + L; k++)
+                    if (b.HighPrices[k] > val) return false;
+                return true;
+            }
+            else
+            {
+                double val = b.LowPrices[i];
+                for (int k = i - L; k <= i + L; k++)
+                    if (b.LowPrices[k] < val) return false;
+                return true;
+            }
+        }
+
+        private TimeFrame TfFromMinutes(int m)
+        {
+            switch (m)
+            {
+                case 1: return TimeFrame.Minute;
+                case 2: return TimeFrame.Minute2;
+                case 3: return TimeFrame.Minute3;
+                case 4: return TimeFrame.Minute4;
+                case 5: return TimeFrame.Minute5;
+                case 10: return TimeFrame.Minute10;
+                case 15: return TimeFrame.Minute15;
+                case 20: return TimeFrame.Minute20;
+                case 30: return TimeFrame.Minute30;
+                case 45: return TimeFrame.Minute45;
+                case 60: return TimeFrame.Hour;
+                case 120: return TimeFrame.Hour2;
+                case 180: return TimeFrame.Hour3;
+                case 240: return TimeFrame.Hour4;
+                case 360: return TimeFrame.Hour6;
+                case 720: return TimeFrame.Hour12;
+                case 1440: return TimeFrame.Daily;
+                default:
+                    // aproxima al más cercano soportado
+                    if (m < 2) return TimeFrame.Minute;
+                    if (m < 3) return TimeFrame.Minute2;
+                    if (m < 4) return TimeFrame.Minute3;
+                    if (m < 5) return TimeFrame.Minute4;
+                    if (m < 10) return TimeFrame.Minute5;
+                    if (m < 15) return TimeFrame.Minute10;
+                    if (m < 20) return TimeFrame.Minute15;
+                    if (m < 30) return TimeFrame.Minute20;
+                    if (m < 45) return TimeFrame.Minute30;
+                    if (m < 60) return TimeFrame.Minute45;
+                    if (m < 120) return TimeFrame.Hour;
+                    if (m < 180) return TimeFrame.Hour2;
+                    if (m < 240) return TimeFrame.Hour3;
+                    if (m < 360) return TimeFrame.Hour4;
+                    if (m < 720) return TimeFrame.Hour6;
+                    if (m < 1440) return TimeFrame.Hour12;
+                    return TimeFrame.Daily;
+            }
+        }
+
+        private bool ShouldUseStructureFilter()
+        {
+            if (UseStructureFilter == StructureFilterMode.Disabled) return false;
+
+            // Activa el filtro si la volatilidad está por debajo de un valor absoluto
+            if (UseStructureFilter == StructureFilterMode.Fixed)
+            {
+                double atrPct = DailyAtrPct();
+                if (atrPct < 0) return true;           // sin datos suficientes: conserva filtro
+                return atrPct <= AtrPctThreshold;      // baja vol -> filtra; alta vol -> no filtra
+            }
+
+            // Compara la volatilidad actual con su propio promedio histórico
+            if (UseStructureFilter == StructureFilterMode.Auto)
+            {
+                double ratio = DailyAtrPctRatio();   // < 1 = vol actual por debajo de su media
+                if (ratio < 0) return true;          // sin datos suficientes: conserva filtro
+                return ratio <= AtrRatioThreshold;   // vol baja relativa => usar filtro
+            }
+            return false;
+
+        }
+
+        private double DailyAtrPct()
+        {
+            // ATR% = ATR_D1 / SMA_Close_D1 * 100
+            if (_d1Bars == null || _d1Bars.Count < AtrDays + 2) return -1;
+
+            int last = _d1Bars.Count - 2; // última barra D1 cerrada
+            double sumTR = 0, sumClose = 0;
+
+            for (int i = last - AtrDays + 1; i <= last; i++)
+            {
+                double high = _d1Bars.HighPrices[i];
+                double low = _d1Bars.LowPrices[i];
+                double prev = _d1Bars.ClosePrices[i - 1];
+
+                double tr = Math.Max(high - low, Math.Max(Math.Abs(high - prev), Math.Abs(low - prev)));
+                sumTR += tr;
+                sumClose += _d1Bars.ClosePrices[i];
+            }
+
+            double atr = sumTR / AtrDays;
+            double sma = sumClose / AtrDays;
+            if (sma <= 0) return -1;
+
+            return atr / sma * 100.0;
+        }
+
+        // ratio = ATR%(hoy) / SMA(ATR%, N)
+        private double DailyAtrPctRatio()
+        {
+            if (_d1Bars == null) return -1;
+
+            int need = Math.Max(AtrDays, AtrPctSmaPeriod) + 2;
+            if (_d1Bars.Count < need) return -1;
+
+            int last = _d1Bars.Count - 2; // última D1 cerrada
+
+            // ATR% actual
+            double atrNow = 0, smaCloseNow = 0;
+            for (int i = last - AtrDays + 1; i <= last; i++)
+            {
+                double h = _d1Bars.HighPrices[i];
+                double l = _d1Bars.LowPrices[i];
+                double pc = _d1Bars.ClosePrices[i - 1];
+                double tr = Math.Max(h - l, Math.Max(Math.Abs(h - pc), Math.Abs(l - pc)));
+                atrNow += tr;
+                smaCloseNow += _d1Bars.ClosePrices[i];
+            }
+            atrNow /= AtrDays;
+            double meanCloseNow = smaCloseNow / AtrDays;
+            if (meanCloseNow <= 0) return -1;
+            double atrPctNow = atrNow / meanCloseNow * 100.0;
+
+            // SMA de ATR% (período AtrPctSmaPeriod)
+            double sumAtrPct = 0;
+            for (int j = last - AtrPctSmaPeriod + 1; j <= last; j++)
+            {
+                // ATR% día j
+                double atr = 0, sumClose = 0;
+                for (int i = j - AtrDays + 1; i <= j; i++)
+                {
+                    double h = _d1Bars.HighPrices[i];
+                    double l = _d1Bars.LowPrices[i];
+                    double pc = _d1Bars.ClosePrices[i - 1];
+                    double tr = Math.Max(h - l, Math.Max(Math.Abs(h - pc), Math.Abs(l - pc)));
+                    atr += tr;
+                    sumClose += _d1Bars.ClosePrices[i];
+                }
+                atr /= AtrDays;
+                double meanClose = sumClose / AtrDays;
+                if (meanClose <= 0) return -1;
+                sumAtrPct += atr / meanClose * 100.0;
+            }
+            double smaAtrPct = sumAtrPct / AtrPctSmaPeriod;
+            if (smaAtrPct <= 0) return -1;
+
+            return atrPctNow / smaAtrPct;
         }
     }
 }
