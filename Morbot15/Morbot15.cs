@@ -10,17 +10,20 @@ namespace cAlgo.Robots
     public enum StructureFilterMode { Disabled, Fixed, Auto }
 
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
-    public class BARSignalsTrader_CloseBar_Buffer : Robot
+    public class Morbot15 : Robot
     {
         // --- Parámetros ---
         [Parameter("Risk Per Trade (%)", DefaultValue = 2.0, MinValue = 0.1)]
         public double RiskPercent { get; set; }
 
-        [Parameter("SL Offset (pips)", DefaultValue = 20, MinValue = 0)]
+        [Parameter("SL Offset (Pips)", DefaultValue = 20, MinValue = 0)]
         public int ExtraSLPips { get; set; }
 
         [Parameter("TP Distance (R)", DefaultValue = 2.0, MinValue = 0.1)]
         public double TpRR { get; set; }
+
+        [Parameter("Market Structure Filter", DefaultValue = true)]
+        public StructureFilterMode UseStructureFilter { get; set; }
 
         [Parameter("DD Threshold (%)", DefaultValue = 0.0, MinValue = 0.0)]
         public double DdThresholdPct { get; set; }
@@ -28,14 +31,11 @@ namespace cAlgo.Robots
         [Parameter("Defensive Risk (%)", DefaultValue = 1.0, MinValue = 0.1)]
         public double DefensiveRiskPercent { get; set; }
 
-        [Parameter("Market Structure Filter", DefaultValue = true)]
-        public StructureFilterMode UseStructureFilter { get; set; }
-
         [Parameter("RR Tracts", DefaultValue = "")]
         public string RrStepsStr { get; set; }
 
         // Constantes
-        private const string LabelName = "BARSignalsTrader_CloseBar_Buffer";
+        private const string LabelName = "Morbot15";
         private const string NoTradeAfterEtStr = "11:00";
         private const bool CloseAtSessionEnd = true;
         private const int DailyTradeLimit = 1;
@@ -140,7 +140,8 @@ namespace cAlgo.Robots
             double barHigh = Bars.HighPrices.Last(1);
             double barLow = Bars.LowPrices.Last(1);
 
-            double riskToUse = (_defensiveMode && _enableDefensiveMode) ? DefensiveRiskPercent : RiskPercent;
+            bool useDefensiveRisk = (_enableDefensiveMode && _defensiveMode) || applyStruct;
+            double riskToUse = useDefensiveRisk ? DefensiveRiskPercent : RiskPercent;
 
             if (buy)
             {
@@ -543,7 +544,6 @@ namespace cAlgo.Robots
         {
             if (UseStructureFilter == StructureFilterMode.Disabled) return false;
 
-            // Activa el filtro si la volatilidad está por debajo de un valor absoluto
             if (UseStructureFilter == StructureFilterMode.Fixed)
             {
                 double atrPct = DailyAtrPct();
@@ -551,7 +551,6 @@ namespace cAlgo.Robots
                 return atrPct <= AtrPctThreshold;      // baja vol -> filtra; alta vol -> no filtra
             }
 
-            // Compara la volatilidad actual con su propio promedio histórico
             if (UseStructureFilter == StructureFilterMode.Auto)
             {
                 double ratio = DailyAtrPctRatio();   // < 1 = vol actual por debajo de su media
